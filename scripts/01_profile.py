@@ -1,23 +1,6 @@
-"""
-Detailed dataset profiling for Amazon ML Challenge 2026.
-
-This script analyzes:
-- dataset sizes
-- columns
-- ID patterns
-- country distributions
-- name statistics
-- address statistics
-- missing values
-- empty values
-- duplicate IDs
-- ground-truth match distribution
-"""
-
-import json
-import re
-import sys
 from pathlib import Path
+import json
+import sys
 
 import pandas as pd
 
@@ -28,58 +11,70 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-CODE_DIR = PROJECT_ROOT / "code"
+sys.path.insert(
+    0,
+    str(PROJECT_ROOT / "code" / "business_entity_resolution")
+)
 
-if str(CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(CODE_DIR))
-
-
-# ============================================================
-# PROJECT IMPORTS
-# ============================================================
-
-from business_entity_resolution.src.config import (
+from src.config import (
+    TRAIN_SOURCE1,
+    TRAIN_SOURCE2,
+    TRAIN_SOURCE3,
+    TRAIN_GROUND_TRUTH,
+    TEST_SOURCE1,
+    TEST_SOURCE2,
+    TEST_SOURCE3,
     REPORTS_DIR,
+    create_project_directories,
 )
 
-from business_entity_resolution.src.data_loader import (
-    load_train_source1,
-    load_train_source2,
-    load_train_source3,
-    load_train_ground_truth,
-    load_test_source1,
-    load_test_source2,
-    load_test_source3,
+from src.data_loader import (
+    load_source1,
+    load_source2,
+    load_source3,
+    load_ground_truth,
 )
 
 
 # ============================================================
-# STRING PROFILE
+# CONFIGURATION
 # ============================================================
 
-def profile_string_column(
-    series: pd.Series,
-) -> dict:
-    """
-    Generate statistics for a text column.
-    """
+TEXT_COLUMNS = [
+    "business_name",
+    "business_address",
+    "country",
+]
 
-    values = series.fillna("").astype(str)
+ID_COLUMN = "entity_id"
 
-    lengths = values.str.len()
 
-    empty_mask = values.str.strip().eq("")
+# ============================================================
+# TEXT PROFILE
+# ============================================================
+
+def profile_text_column(df: pd.DataFrame, column: str) -> dict:
+    if column not in df.columns:
+        return {
+            "exists": False
+        }
+
+    series = df[column]
+
+    string_series = series.fillna("").astype(str)
+
+    lengths = string_series.str.len()
 
     return {
-        "total": int(len(values)),
+        "exists": True,
         "null_count": int(series.isna().sum()),
-        "empty_count": int(empty_mask.sum()),
-        "min_length": int(lengths.min()),
-        "max_length": int(lengths.max()),
-        "mean_length": float(lengths.mean()),
-        "median_length": float(lengths.median()),
-        "p25_length": float(lengths.quantile(0.25)),
-        "p75_length": float(lengths.quantile(0.75)),
+        "empty_count": int((string_series.str.strip() == "").sum()),
+        "min_length": int(lengths.min()) if len(lengths) else 0,
+        "max_length": int(lengths.max()) if len(lengths) else 0,
+        "mean_length": float(lengths.mean()) if len(lengths) else 0,
+        "median_length": float(lengths.median()) if len(lengths) else 0,
+        "p25_length": float(lengths.quantile(0.25)) if len(lengths) else 0,
+        "p75_length": float(lengths.quantile(0.75)) if len(lengths) else 0,
     }
 
 
@@ -87,43 +82,22 @@ def profile_string_column(
 # ID PROFILE
 # ============================================================
 
-def profile_ids(series: pd.Series) -> dict:
-    """
-    Analyze entity IDs.
-    """
+def profile_id_column(df: pd.DataFrame, column: str) -> dict:
+    if column not in df.columns:
+        return {
+            "exists": False
+        }
 
-    values = (
-        series
-        .dropna()
-        .astype(str)
-    )
-
-    prefixes = {}
-
-    for value in values:
-
-        # Extract alphabetic prefix at the beginning.
-        match = re.match(r"^[A-Za-z]+", value)
-
-        prefix = (
-            match.group(0)
-            if match
-            else "<NO_PREFIX>"
-        )
-
-        prefixes[prefix] = (
-            prefixes.get(prefix, 0) + 1
-        )
+    series = df[column]
 
     return {
-        "total": int(len(series)),
+        "exists": True,
+        "row_count": int(len(series)),
         "null_count": int(series.isna().sum()),
-        "unique_count": int(series.nunique()),
+        "unique_count": int(series.nunique(dropna=True)),
         "duplicate_count": int(
-            series.duplicated().sum()
+            series.duplicated(keep=False).sum()
         ),
-        "prefix_counts": prefixes,
-        "sample_ids": values.head(20).tolist(),
     }
 
 
@@ -131,106 +105,65 @@ def profile_ids(series: pd.Series) -> dict:
 # COUNTRY PROFILE
 # ============================================================
 
-def profile_country(
-    series: pd.Series,
-) -> dict:
-    """
-    Analyze country values.
-    """
+def profile_country(df: pd.DataFrame) -> dict:
+    if "country" not in df.columns:
+        return {}
 
-    values = (
-        series
-        .fillna("<NULL>")
+    country_series = (
+        df["country"]
+        .fillna("")
         .astype(str)
         .str.strip()
     )
 
-    counts = values.value_counts()
+    counts = country_series.value_counts(dropna=False)
 
     return {
-        "unique_countries": int(
-            values.nunique()
-        ),
-        "distribution": {
-            str(country): int(count)
-            for country, count in counts.items()
-        },
+        str(country): int(count)
+        for country, count in counts.head(50).items()
     }
 
 
 # ============================================================
-# SOURCE PROFILE
+# DUPLICATE ROW PROFILE
 # ============================================================
 
-def profile_source(
-    df: pd.DataFrame,
-    name: str,
-) -> dict:
-    """
-    Generate a detailed profile for a source dataframe.
-    """
+def profile_duplicate_rows(df: pd.DataFrame) -> dict:
 
-    print(f"\nProfiling {name}...")
+    return {
+        "duplicate_full_rows": int(
+            df.duplicated().sum()
+        )
+    }
+
+
+# ============================================================
+# SOURCE DATASET PROFILE
+# ============================================================
+
+def profile_source(df: pd.DataFrame, dataset_name: str) -> dict:
 
     profile = {
-        "dataset": name,
+        "dataset": dataset_name,
         "rows": int(len(df)),
         "columns": list(df.columns),
+        "dtypes": {
+            column: str(dtype)
+            for column, dtype in df.dtypes.items()
+        },
+        "id_profile": profile_id_column(
+            df,
+            ID_COLUMN
+        ),
+        "text_profile": {},
+        "country_distribution": profile_country(df),
+        "duplicates": profile_duplicate_rows(df),
     }
 
-    # --------------------------------------------------------
-    # IDs
-    # --------------------------------------------------------
-
-    if "entity_id" in df.columns:
-
-        profile["entity_id"] = profile_ids(
-            df["entity_id"]
+    for column in TEXT_COLUMNS:
+        profile["text_profile"][column] = (
+            profile_text_column(df, column)
         )
-
-    # --------------------------------------------------------
-    # Business name
-    # --------------------------------------------------------
-
-    if "business_name" in df.columns:
-
-        profile["business_name"] = (
-            profile_string_column(
-                df["business_name"]
-            )
-        )
-
-    # --------------------------------------------------------
-    # Business address
-    # --------------------------------------------------------
-
-    if "business_address" in df.columns:
-
-        profile["business_address"] = (
-            profile_string_column(
-                df["business_address"]
-            )
-        )
-
-    # --------------------------------------------------------
-    # Country
-    # --------------------------------------------------------
-
-    if "country" in df.columns:
-
-        profile["country"] = (
-            profile_country(
-                df["country"]
-            )
-        )
-
-    # --------------------------------------------------------
-    # Full duplicate rows
-    # --------------------------------------------------------
-
-    profile["duplicate_rows"] = int(
-        df.duplicated().sum()
-    )
 
     return profile
 
@@ -239,61 +172,86 @@ def profile_source(
 # GROUND TRUTH PROFILE
 # ============================================================
 
-def profile_ground_truth(
-    df: pd.DataFrame,
-) -> dict:
-    """
-    Analyze ground-truth match distribution.
+def profile_ground_truth(df: pd.DataFrame) -> dict:
 
-    The exact parsing of matched_entity_ids depends on the
-    challenge file format. This function first reports the
-    raw values and basic structure.
-    """
-
-    result = {
+    profile = {
         "rows": int(len(df)),
         "columns": list(df.columns),
+        "dtypes": {
+            column: str(dtype)
+            for column, dtype in df.dtypes.items()
+        },
         "null_counts": {
-            column: int(count)
-            for column, count in df.isna().sum().items()
+            column: int(df[column].isna().sum())
+            for column in df.columns
         },
     }
 
     if "source1_entity_id" in df.columns:
 
-        result["source1_unique_ids"] = int(
-            df["source1_entity_id"].nunique()
-        )
-
-        result["source1_duplicate_ids"] = int(
-            df["source1_entity_id"].duplicated().sum()
-        )
+        profile["source1_entity_id"] = {
+            "unique_count": int(
+                df["source1_entity_id"].nunique(
+                    dropna=True
+                )
+            ),
+            "duplicate_count": int(
+                df["source1_entity_id"]
+                .duplicated(keep=False)
+                .sum()
+            ),
+        }
 
     if "matched_entity_ids" in df.columns:
 
-        values = (
+        matched = (
             df["matched_entity_ids"]
             .fillna("")
             .astype(str)
-            .str.strip()
         )
 
-        result["empty_match_rows"] = int(
-            values.eq("").sum()
-        )
-
-        result["sample_values"] = (
-            values.head(20).tolist()
-        )
-
-        # Character-level information.
-        result["match_field_length"] = {
-            "min": int(values.str.len().min()),
-            "max": int(values.str.len().max()),
-            "mean": float(values.str.len().mean()),
+        profile["matched_entity_ids"] = {
+            "empty_count": int(
+                (matched.str.strip() == "").sum()
+            ),
+            "sample_values": (
+                matched.head(20).tolist()
+            ),
+            "max_string_length": int(
+                matched.str.len().max()
+            ) if len(matched) else 0,
         }
 
-    return result
+    return profile
+
+
+# ============================================================
+# SAFE LOAD
+# ============================================================
+
+def load_and_profile_source(
+    path: Path,
+    loader,
+    name: str
+):
+
+    print(f"\nLoading: {name}")
+    print(f"Path: {path}")
+
+    if not path.exists():
+        print("WARNING: File does not exist.")
+        return {
+            "dataset": name,
+            "exists": False,
+            "path": str(path),
+        }
+
+    df = loader(path)
+
+    print(f"Rows: {len(df):,}")
+    print(f"Columns: {len(df.columns)}")
+
+    return profile_source(df, name)
 
 
 # ============================================================
@@ -303,95 +261,112 @@ def profile_ground_truth(
 def main():
 
     print("=" * 70)
-    print("Amazon ML Challenge 2026 - Detailed Data Profiling")
+    print("AMAZON ML CHALLENGE 2026")
+    print("DATASET PROFILING")
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Load datasets
-    # --------------------------------------------------------
-
-    print("\nLoading training datasets...")
-
-    train_source1 = load_train_source1()
-    train_source2 = load_train_source2()
-    train_source3 = load_train_source3()
-    ground_truth = load_train_ground_truth()
-
-    print("Loading test datasets...")
-
-    test_source1 = load_test_source1()
-    test_source2 = load_test_source2()
-    test_source3 = load_test_source3()
-
-    # --------------------------------------------------------
-    # Profile
-    # --------------------------------------------------------
+    create_project_directories()
 
     report = {
+        "project_root": str(PROJECT_ROOT),
         "train": {},
         "test": {},
         "ground_truth": {},
     }
 
-    report["train"]["source1"] = profile_source(
-        train_source1,
+    # --------------------------------------------------------
+    # TRAIN
+    # --------------------------------------------------------
+
+    report["train"]["source1"] = load_and_profile_source(
+        TRAIN_SOURCE1,
+        load_source1,
         "train_source1",
     )
 
-    report["train"]["source2"] = profile_source(
-        train_source2,
+    report["train"]["source2"] = load_and_profile_source(
+        TRAIN_SOURCE2,
+        load_source2,
         "train_source2",
     )
 
-    report["train"]["source3"] = profile_source(
-        train_source3,
+    report["train"]["source3"] = load_and_profile_source(
+        TRAIN_SOURCE3,
+        load_source3,
         "train_source3",
     )
 
-    report["test"]["source1"] = profile_source(
-        test_source1,
+    # --------------------------------------------------------
+    # TEST
+    # --------------------------------------------------------
+
+    report["test"]["source1"] = load_and_profile_source(
+        TEST_SOURCE1,
+        load_source1,
         "test_source1",
     )
 
-    report["test"]["source2"] = profile_source(
-        test_source2,
+    report["test"]["source2"] = load_and_profile_source(
+        TEST_SOURCE2,
+        load_source2,
         "test_source2",
     )
 
-    report["test"]["source3"] = profile_source(
-        test_source3,
+    report["test"]["source3"] = load_and_profile_source(
+        TEST_SOURCE3,
+        load_source3,
         "test_source3",
     )
 
-    report["ground_truth"] = profile_ground_truth(
-        ground_truth
-    )
-
     # --------------------------------------------------------
-    # Save
+    # GROUND TRUTH
     # --------------------------------------------------------
 
-    REPORTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    print("\nLoading: train_ground_truth")
+    print(f"Path: {TRAIN_GROUND_TRUTH}")
+
+    if TRAIN_GROUND_TRUTH.exists():
+
+        gt = load_ground_truth(
+            TRAIN_GROUND_TRUTH
+        )
+
+        report["ground_truth"] = (
+            profile_ground_truth(gt)
+        )
+
+    else:
+
+        report["ground_truth"] = {
+            "exists": False,
+            "path": str(TRAIN_GROUND_TRUTH),
+        }
+
+    # --------------------------------------------------------
+    # SAVE REPORT
+    # --------------------------------------------------------
 
     output_file = (
         REPORTS_DIR /
         "phase0_profile.json"
     )
 
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
     with open(
         output_file,
         "w",
-        encoding="utf-8",
-    ) as file:
+        encoding="utf-8"
+    ) as f:
 
         json.dump(
             report,
-            file,
+            f,
             indent=2,
-            ensure_ascii=False,
+            ensure_ascii=False
         )
 
     print("\n" + "=" * 70)
