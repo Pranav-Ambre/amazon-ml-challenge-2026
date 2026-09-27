@@ -1,0 +1,357 @@
+{
+  "datasets": {
+    "train_source1": {
+      "name": "train_source1",
+      "rows": 2206821,
+      "columns": [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country"
+      ],
+      "dtypes": {
+        "entity_id": "str",
+        "business_name": "str",
+        "business_address": "str",
+        "country": "str"
+      },
+      "null_counts": {
+        "entity_id": 0,
+        "business_name": 0,
+        "business_address": 0,
+        "country": 0
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {},
+      "unique_entity_ids": 2206821,
+      "duplicate_entity_ids": 0,
+      "sample_entity_ids": [
+        "S1-925783039",
+        "S1-773889195",
+        "S1-377745466",
+        "S1-133037285",
+        "S1-755362802",
+        "S1-851869949",
+        "S1-785847572",
+        "S1-27541239",
+        "S1-629417405",
+        "S1-22305073"
+      ],
+      "country_counts": {
+        "US": 1323633,
+        "India": 883188
+      },
+      "business_name_length": {
+        "min": 3,
+        "max": 105,
+        "mean": 24.03440333402664,
+        "median": 24.0
+      },
+      "business_address_length": {
+        "min": 11,
+        "max": 256,
+        "mean": 52.06621289175697,
+        "median": 41.0
+      }
+    },
+    "train_source2": {
+      "name": "train_source2",
+      "rows": 5034616,
+      "columns": [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country"
+      ],
+      "dtypes": {
+        "entity_id": "str",
+        "business_name": "str",
+        "business_address": "str",
+        "country": "str"
+      },
+      "null_counts": {
+        "entity_id": 0,
+        "business_name": 2,
+        "business_address": 168967,
+        "country": 0
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {},
+      "unique_entity_ids": 5034616,
+      "duplicate_entity_ids": 0,
+      "sample_entity_ids": [
+        "S2-166376419",
+        "S2-764573417",
+        "S2-639257739",
+        "S2-163963287",
+        "S2-49942811",
+        "S2-138046867",
+        "S2-584977605",
+        "S2-277444929",
+        "S2-721031885",
+        "S2-508602797"
+      ],
+      "country_counts": {
+        "US": 3016817,
+        "India": 2017799
+      },
+      "business_name_length": {
+        "min": 0,
+        "max": 104,
+        "mean": 25.103574135544797,
+        "median": 25.0
+      },
+      "business_address_length": {
+        "min": 0,
+        "max": 249,
+        "mean": 46.22590858965212,
+        "median": 37.0
+      }
+    },
+    "train_source3": {
+      "name": "train_source3",
+      "rows": 5285603,
+      "columns": [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country"
+      ],
+      "dtypes": {
+        "entity_id": "str",
+        "business_name": "str",
+        "business_address": "str",
+        "country": "str"
+      },
+      "null_counts": {
+        "entity_id": 0,
+        "business_name": 13,
+        "business_address": 175916,
+        "country": 0
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {},
+      "unique_entity_ids": 5285603,
+      "duplicate_entity_ids": 0,
+      "sample_entity_ids": [
+        "S3-202863386",
+        "S3-859268022",
+        "S3-22467283",
+        "S3-671162755",
+        "S3-960981775",
+        "S3-578159284",
+        "S3-121412624",
+        "S3-249416830",
+        "S3-107644605",
+        "S3-160217003"
+      ],
+      "country_counts": {
+        "US": 3170056,
+        "India": 2115547
+      },
+      "business_name_length": {
+        "min": 0,
+        "max": 123,
+        "mean": 25.20213890449207,
+        "median": 25.0
+      },
+      "business_address_length": {
+        "min": 0,
+        "max": 240,
+        "mean": 46.71443731207206,
+        "median": 42.0
+      }
+    },
+    "train_ground_truth": {
+      "name": "train_ground_truth",
+      "rows": 2206821,
+      "columns": [
+        "source1_entity_id",
+        "matched_entity_ids"
+      ],
+      "dtypes": {
+        "source1_entity_id": "str",
+        "matched_entity_ids": "str"
+      },
+      "null_counts": {
+        "source1_entity_id": 0,
+        "matched_entity_ids": 123247
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {}
+    },
+    "test_source1": {
+      "name": "test_source1",
+      "rows": 1732544,
+      "columns": [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country"
+      ],
+      "dtypes": {
+        "entity_id": "str",
+        "business_name": "str",
+        "business_address": "str",
+        "country": "str"
+      },
+      "null_counts": {
+        "entity_id": 0,
+        "business_name": 0,
+        "business_address": 0,
+        "country": 0
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {},
+      "unique_entity_ids": 1732544,
+      "duplicate_entity_ids": 0,
+      "sample_entity_ids": [
+        "S1-714132312",
+        "S1-106407869",
+        "S1-156285671",
+        "S1-689823050",
+        "S1-921369899",
+        "S1-481669221",
+        "S1-909865979",
+        "S1-280204013",
+        "S1-742053041",
+        "S1-913506265"
+      ],
+      "country_counts": {
+        "India": 809986,
+        "US": 663106,
+        "France": 259452
+      },
+      "business_name_length": {
+        "min": 3,
+        "max": 92,
+        "mean": 23.83642608788002,
+        "median": 24.0
+      },
+      "business_address_length": {
+        "min": 11,
+        "max": 268,
+        "mean": 57.213179578700455,
+        "median": 50.0
+      }
+    },
+    "test_source2": {
+      "name": "test_source2",
+      "rows": 4887273,
+      "columns": [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country"
+      ],
+      "dtypes": {
+        "entity_id": "str",
+        "business_name": "str",
+        "business_address": "str",
+        "country": "str"
+      },
+      "null_counts": {
+        "entity_id": 0,
+        "business_name": 46,
+        "business_address": 129408,
+        "country": 0
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {},
+      "unique_entity_ids": 4887273,
+      "duplicate_entity_ids": 0,
+      "sample_entity_ids": [
+        "S2-192345572",
+        "S2-566025912",
+        "S2-158121477",
+        "S2-89663826",
+        "S2-884102769",
+        "S2-910351373",
+        "S2-229677112",
+        "S2-770341988",
+        "S2-375151053",
+        "S2-701289183"
+      ],
+      "country_counts": {
+        "India": 2312565,
+        "US": 1871330,
+        "France": 703378
+      },
+      "business_name_length": {
+        "min": 0,
+        "max": 102,
+        "mean": 25.703627360288653,
+        "median": 25.0
+      },
+      "business_address_length": {
+        "min": 0,
+        "max": 269,
+        "mean": 50.413405594490015,
+        "median": 43.0
+      }
+    },
+    "test_source3": {
+      "name": "test_source3",
+      "rows": 5082316,
+      "columns": [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country"
+      ],
+      "dtypes": {
+        "entity_id": "str",
+        "business_name": "str",
+        "business_address": "str",
+        "country": "str"
+      },
+      "null_counts": {
+        "entity_id": 0,
+        "business_name": 59,
+        "business_address": 136098,
+        "country": 0
+      },
+      "duplicate_rows": 0,
+      "empty_string_counts": {},
+      "unique_entity_ids": 5082316,
+      "duplicate_entity_ids": 0,
+      "sample_entity_ids": [
+        "S3-462677478",
+        "S3-374810425",
+        "S3-198586129",
+        "S3-10300249",
+        "S3-604980231",
+        "S3-577972146",
+        "S3-150632472",
+        "S3-184785497",
+        "S3-536202929",
+        "S3-560657213"
+      ],
+      "country_counts": {
+        "India": 2405000,
+        "US": 1945701,
+        "France": 731615
+      },
+      "business_name_length": {
+        "min": 0,
+        "max": 103,
+        "mean": 25.655171185735007,
+        "median": 25.0
+      },
+      "business_address_length": {
+        "min": 0,
+        "max": 267,
+        "mean": 48.74047087981149,
+        "median": 43.0
+      }
+    }
+  },
+  "ground_truth": {
+    "rows": 2206821,
+    "zero_match_entities": 123247,
+    "singleton_entities": 119157,
+    "multi_match_entities": 1964417,
+    "maximum_matches": 11,
+    "average_matches": 3.4612526344456573
+  }
+}
