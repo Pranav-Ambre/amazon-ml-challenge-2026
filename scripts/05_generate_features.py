@@ -4,28 +4,22 @@
 Stage 05 - Training Feature Generation
 Amazon ML Challenge 2026 - Business Entity Resolution
 
-Deadline-oriented implementation.
+Strategy
+--------
+1. Load official training ground truth.
+2. Expand comma-separated matched_entity_ids.
+3. Retrieve all ground-truth pairs present in candidate files.
+4. Sample approximately 1 negative per positive.
+5. Join normalized Source 1 + Source 2/3 data.
+6. Generate lightweight deterministic pairwise features.
+7. Write:
+       artifacts/features/train_features_s2.parquet
+       artifacts/features/train_features_s3.parquet
 
-Pipeline:
-    Ground Truth
-        ↓
-    Candidate pairs
-        ↓
-    Retrieve all candidate positives
-        ↓
-    Deterministic negative sampling
-        ↓
-    Join normalized Source 1 + Source 2/3
-        ↓
-    Pairwise features
-        ↓
-    train_features_s2.parquet
-    train_features_s3.parquet
-
-Important:
-    We do NOT generate features for all 444M+ candidates.
-    We retain all retrieved positives and sample approximately
-    1 negative for every positive.
+Important
+---------
+We DO NOT generate features for all 444M+ candidates.
+Only retrieved positives + sampled negatives are feature-engineered.
 """
 
 from __future__ import annotations
@@ -59,11 +53,8 @@ MAX_NEGATIVES = 8_000_000
 # =============================================================================
 
 NORMALIZED_DIR = ARTIFACTS_DIR / "normalized"
-
 CANDIDATES_DIR = ARTIFACTS_DIR / "candidates"
-
 FEATURE_DIR = ARTIFACTS_DIR / "features"
-
 REPORT_DIR = ARTIFACTS_DIR / "reports"
 
 
@@ -79,7 +70,7 @@ REPORT_DIR.mkdir(
 
 
 # =============================================================================
-# NORMALIZED DATA
+# NORMALIZED FILES
 # =============================================================================
 
 TRAIN_S1 = (
@@ -99,7 +90,7 @@ TRAIN_S3 = (
 
 
 # =============================================================================
-# CANDIDATES
+# CANDIDATE FILES
 # =============================================================================
 
 CAND_S2 = (
@@ -114,7 +105,7 @@ CAND_S3 = (
 
 
 # =============================================================================
-# OUTPUTS
+# OUTPUT FILES
 # =============================================================================
 
 OUT_S2 = (
@@ -157,9 +148,6 @@ LOGGER = logging.getLogger(
 # =============================================================================
 
 def check_paths() -> None:
-    """
-    Verify that all required Stage 05 inputs exist.
-    """
 
     required_paths = [
         TRAIN_S1,
@@ -192,24 +180,15 @@ def load_ground_truth_pairs() -> tuple[
     int,
 ]:
     """
-    Load and normalize the official training ground truth.
+    Load official training ground truth and convert:
 
-    Ground truth format:
+        source1_entity_id | matched_entity_ids
 
-        source1_entity_id
-        matched_entity_ids
+    into:
 
-    matched_entity_ids is a comma-separated string.
+        source1_entity_id | candidate_entity_id
 
-    Example:
-
-        A123 -> B1,B2,B3
-
-    becomes:
-
-        A123 -> B1
-        A123 -> B2
-        A123 -> B3
+    One row per true pair.
     """
 
     LOGGER.info(
@@ -230,7 +209,7 @@ def load_ground_truth_pairs() -> tuple[
     )
 
     # -------------------------------------------------------------------------
-    # Keep required columns
+    # Required columns
     # -------------------------------------------------------------------------
 
     gt = gt.select(
@@ -281,11 +260,12 @@ def load_ground_truth_pairs() -> tuple[
     )
 
     # -------------------------------------------------------------------------
-    # Expand comma-separated IDs
+    # Expand matched_entity_ids
     # -------------------------------------------------------------------------
 
     pairs = (
         gt
+
         .filter(
             pl.col(
                 "matched_entity_ids"
@@ -368,12 +348,9 @@ def retrieve_positive_pairs(
     candidate_path: Path,
 ) -> pl.DataFrame:
     """
-    Retrieve ground-truth pairs that are actually present
-    in the generated candidate set.
+    Keep only GT pairs that exist in the candidate set.
 
-    Important:
-        This gives us the maximum positives the downstream
-        model can learn from under the current blocking strategy.
+    Blocking recall determines the maximum possible positive count.
     """
 
     LOGGER.info(
@@ -385,11 +362,22 @@ def retrieve_positive_pairs(
         pl.scan_parquet(
             candidate_path
         )
+
         .select(
             [
-                "source1_entity_id",
-                "candidate_entity_id",
-                "block_support_count",
+                pl.col(
+                    "source1_entity_id"
+                )
+                .cast(pl.Utf8),
+
+                pl.col(
+                    "candidate_entity_id"
+                )
+                .cast(pl.Utf8),
+
+                pl.col(
+                    "block_support_count"
+                ),
             ]
         )
     )
@@ -439,12 +427,12 @@ def sample_negatives(
     positive_count: int,
 ) -> pl.DataFrame:
     """
-    Deterministically sample negatives from candidate pairs.
+    Sample deterministic negatives from the candidate set.
 
-    Ground-truth pairs are removed first.
+    All known ground-truth pairs are removed first.
 
-    Sampling is performed using a deterministic hash so
-    repeated runs produce the same negative sample.
+    Approximately:
+        negatives = positives * NEGATIVE_TO_POSITIVE_RATIO
     """
 
     target = min(
@@ -470,7 +458,7 @@ def sample_negatives(
     )
 
     # -------------------------------------------------------------------------
-    # Candidate scan
+    # Candidate scan + anti join
     # -------------------------------------------------------------------------
 
     candidates = (
@@ -480,9 +468,19 @@ def sample_negatives(
 
         .select(
             [
-                "source1_entity_id",
-                "candidate_entity_id",
-                "block_support_count",
+                pl.col(
+                    "source1_entity_id"
+                )
+                .cast(pl.Utf8),
+
+                pl.col(
+                    "candidate_entity_id"
+                )
+                .cast(pl.Utf8),
+
+                pl.col(
+                    "block_support_count"
+                ),
             ]
         )
 
@@ -493,7 +491,7 @@ def sample_negatives(
             ]
         )
 
-        # Remove all known true pairs.
+        # Remove true GT pairs.
         .join(
             gt_lazy,
 
@@ -554,7 +552,61 @@ def sample_negatives(
 
 
 # =============================================================================
-# FEATURE JOIN
+# TOKEN OVERLAP HELPER
+# =============================================================================
+
+def token_overlap_expr(
+    left_column: str,
+    right_column: str,
+    output_name: str,
+) -> pl.Expr:
+    """
+    Calculate token intersection for columns stored as STRING.
+
+    Example:
+
+        "abc xyz pvt"
+
+    becomes:
+
+        ["abc", "xyz", "pvt"]
+
+    before list intersection.
+
+    The normalized token columns in this project are strings,
+    not native Polars List columns.
+    """
+
+    return (
+        pl.col(
+            left_column
+        )
+        .fill_null("")
+        .str.strip_chars()
+        .str.split(" ")
+
+        .list.set_intersection(
+
+            pl.col(
+                right_column
+            )
+            .fill_null("")
+            .str.strip_chars()
+            .str.split(" ")
+        )
+
+        .list.len()
+
+        .cast(pl.Int16)
+
+        .alias(
+            output_name
+        )
+    )
+
+
+# =============================================================================
+# FEATURE GENERATION
 # =============================================================================
 
 def add_features(
@@ -563,19 +615,10 @@ def add_features(
     source_path: Path,
     source_name: str,
 ) -> pl.LazyFrame:
-    """
-    Join Source 1 and Source 2/3 attributes and generate
-    pairwise matching features.
-
-    IMPORTANT:
-        Explicit .alias() expressions are used instead of
-        lazy .rename() to avoid Polars schema-resolution
-        problems.
-    """
 
     LOGGER.info(
         "Preparing features for %s",
-        source_name,
+        source_name.upper(),
     )
 
     # =========================================================================
@@ -716,13 +759,15 @@ def add_features(
     # CANDIDATES
     # =========================================================================
 
+    candidate_path = (
+        CAND_S2
+        if source_name == "s2"
+        else CAND_S3
+    )
+
     candidates = (
         pl.scan_parquet(
-            (
-                CAND_S2
-                if source_name == "s2"
-                else CAND_S3
-            )
+            candidate_path
         )
 
         .select(
@@ -746,8 +791,6 @@ def add_features(
 
     # =========================================================================
     # SOURCE 2 / SOURCE 3
-    #
-    # Explicit aliases are critical here.
     # =========================================================================
 
     source = (
@@ -881,7 +924,7 @@ def add_features(
     )
 
     # =========================================================================
-    # JOIN PAIRS -> CANDIDATE METADATA
+    # JOIN
     # =========================================================================
 
     joined = (
@@ -898,10 +941,6 @@ def add_features(
             how="inner",
         )
 
-        # =====================================================================
-        # JOIN SOURCE 1
-        # =====================================================================
-
         .join(
             s1,
 
@@ -911,10 +950,6 @@ def add_features(
 
             how="left",
         )
-
-        # =====================================================================
-        # JOIN SOURCE 2 / SOURCE 3
-        # =====================================================================
 
         .join(
             source,
@@ -928,15 +963,19 @@ def add_features(
     )
 
     # =========================================================================
-    # EXACT MATCH FEATURES
+    # EXACT FEATURES
     # =========================================================================
 
     joined = joined.with_columns(
 
         (
-            pl.col("s1_name_norm")
+            pl.col(
+                "s1_name_norm"
+            )
             ==
-            pl.col("s2_name_norm")
+            pl.col(
+                "s2_name_norm"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -944,9 +983,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_name_compact")
+            pl.col(
+                "s1_name_compact"
+            )
             ==
-            pl.col("s2_name_compact")
+            pl.col(
+                "s2_name_compact"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -954,9 +997,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_name_alnum")
+            pl.col(
+                "s1_name_alnum"
+            )
             ==
-            pl.col("s2_name_alnum")
+            pl.col(
+                "s2_name_alnum"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -964,9 +1011,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_name_sorted_tokens")
+            pl.col(
+                "s1_name_sorted_tokens"
+            )
             ==
-            pl.col("s2_name_sorted_tokens")
+            pl.col(
+                "s2_name_sorted_tokens"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -974,9 +1025,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_address_norm")
+            pl.col(
+                "s1_address_norm"
+            )
             ==
-            pl.col("s2_address_norm")
+            pl.col(
+                "s2_address_norm"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -984,9 +1039,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_address_compact")
+            pl.col(
+                "s1_address_compact"
+            )
             ==
-            pl.col("s2_address_compact")
+            pl.col(
+                "s2_address_compact"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -994,9 +1053,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_address_alnum")
+            pl.col(
+                "s1_address_alnum"
+            )
             ==
-            pl.col("s2_address_alnum")
+            pl.col(
+                "s2_address_alnum"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -1004,9 +1067,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_address_sorted_tokens")
+            pl.col(
+                "s1_address_sorted_tokens"
+            )
             ==
-            pl.col("s2_address_sorted_tokens")
+            pl.col(
+                "s2_address_sorted_tokens"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -1014,9 +1081,13 @@ def add_features(
         ),
 
         (
-            pl.col("s1_country_norm")
+            pl.col(
+                "s1_country_norm"
+            )
             ==
-            pl.col("s2_country_norm")
+            pl.col(
+                "s2_country_norm"
+            )
         )
         .cast(pl.Int8)
         .alias(
@@ -1024,70 +1095,50 @@ def add_features(
         ),
 
         (
-            pl.col("s1_house_number")
+            pl.col(
+                "s1_house_number"
+            )
             ==
-            pl.col("s2_house_number")
+            pl.col(
+                "s2_house_number"
+            )
         )
         .cast(pl.Int8)
         .alias(
             "house_number_exact"
         ),
 
-        (
-            pl.col("s1_postal_tokens")
-            .list.set_intersection(
-                pl.col(
-                    "s2_postal_tokens"
-                )
-            )
-            .list.len()
-        )
-        .cast(pl.Int16)
-        .alias(
-            "postal_overlap"
+        # ---------------------------------------------------------------------
+        # Token overlaps
+        # ---------------------------------------------------------------------
+
+        token_overlap_expr(
+            "s1_postal_tokens",
+            "s2_postal_tokens",
+            "postal_overlap",
         ),
 
-        (
-            pl.col("s1_address_numeric_tokens")
-            .list.set_intersection(
-                pl.col(
-                    "s2_address_numeric_tokens"
-                )
-            )
-            .list.len()
-        )
-        .cast(pl.Int16)
-        .alias(
-            "address_numeric_overlap"
+        token_overlap_expr(
+            "s1_address_numeric_tokens",
+            "s2_address_numeric_tokens",
+            "address_numeric_overlap",
         ),
 
-        (
-            pl.col("s1_name_tokens")
-            .list.set_intersection(
-                pl.col(
-                    "s2_name_tokens"
-                )
-            )
-            .list.len()
-        )
-        .cast(pl.Int16)
-        .alias(
-            "name_token_overlap"
+        token_overlap_expr(
+            "s1_name_tokens",
+            "s2_name_tokens",
+            "name_token_overlap",
         ),
 
-        (
-            pl.col("s1_address_tokens")
-            .list.set_intersection(
-                pl.col(
-                    "s2_address_tokens"
-                )
-            )
-            .list.len()
-        )
-        .cast(pl.Int16)
-        .alias(
-            "address_token_overlap"
+        token_overlap_expr(
+            "s1_address_tokens",
+            "s2_address_tokens",
+            "address_token_overlap",
         ),
+
+        # ---------------------------------------------------------------------
+        # Blocking support
+        # ---------------------------------------------------------------------
 
         pl.col(
             "block_support_count"
@@ -1146,7 +1197,7 @@ def add_features(
     )
 
     # =========================================================================
-    # LENGTH DIFFERENCES
+    # LENGTH DIFFERENCE
     # =========================================================================
 
     joined = joined.with_columns(
@@ -1258,6 +1309,10 @@ def build_dataset(
         )
     )
 
+    # =========================================================================
+    # COMBINE
+    # =========================================================================
+
     pairs = (
         pl.concat(
             [
@@ -1287,7 +1342,7 @@ def build_dataset(
     )
 
     # =========================================================================
-    # FEATURE GENERATION
+    # FEATURES
     # =========================================================================
 
     feature_lf = add_features(
@@ -1298,7 +1353,7 @@ def build_dataset(
     )
 
     # =========================================================================
-    # FINAL FEATURE COLUMNS
+    # FINAL MODEL FEATURES
     # =========================================================================
 
     feature_lf = feature_lf.select(
@@ -1339,14 +1394,14 @@ def build_dataset(
         ]
     )
 
+    # =========================================================================
+    # COLLECT
+    # =========================================================================
+
     LOGGER.info(
         "Collecting final %s feature dataset...",
         source_name.upper(),
     )
-
-    # =========================================================================
-    # COLLECT
-    # =========================================================================
 
     features = feature_lf.collect(
         engine="streaming"
@@ -1395,9 +1450,12 @@ def build_dataset(
 
     features = features.with_columns(
         [
-            pl.col(column)
+            pl.col(
+                column
+            )
             .fill_null(0)
             .cast(pl.Int32)
+
             for column in numeric_columns
         ]
     )
@@ -1431,7 +1489,7 @@ def build_dataset(
     )
 
     # =========================================================================
-    # OUTPUT PATH
+    # OUTPUT
     # =========================================================================
 
     output_path = (
@@ -1440,10 +1498,6 @@ def build_dataset(
         else OUT_S3
     )
 
-    # =========================================================================
-    # WRITE PARQUET
-    # =========================================================================
-
     LOGGER.info(
         "Writing %s",
         output_path,
@@ -1451,9 +1505,7 @@ def build_dataset(
 
     features.write_parquet(
         output_path,
-
         compression="zstd",
-
         compression_level=3,
     )
 
@@ -1553,13 +1605,13 @@ def main() -> None:
     )
 
     # =========================================================================
-    # VALIDATE INPUTS
+    # INPUT VALIDATION
     # =========================================================================
 
     check_paths()
 
     # =========================================================================
-    # LOAD GROUND TRUTH
+    # GROUND TRUTH
     # =========================================================================
 
     (
@@ -1576,13 +1628,9 @@ def main() -> None:
         report_s2,
     ) = build_dataset(
         gt_pairs=gt_pairs,
-
         candidate_path=CAND_S2,
-
         s1_path=TRAIN_S1,
-
         source_path=TRAIN_S2,
-
         source_name="s2",
     )
 
@@ -1595,13 +1643,9 @@ def main() -> None:
         report_s3,
     ) = build_dataset(
         gt_pairs=gt_pairs,
-
         candidate_path=CAND_S3,
-
         s1_path=TRAIN_S1,
-
         source_path=TRAIN_S3,
-
         source_name="s3",
     )
 
