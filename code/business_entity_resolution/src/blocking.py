@@ -1,76 +1,48 @@
-#!/usr/bin/env python3
-
 """
-Amazon ML Challenge 2026
-Stage 03 — Candidate Blocking
+Memory-safe candidate generation for business entity resolution.
 
-Generates candidate pairs between:
+Pipeline:
+    Normalized Source 1
+        ↓
+    Block-by-block joins
+        ↓
+    Candidate pairs with provenance
+        ↓
+    Deduplicated candidate pairs
+        ↓
+    Parquet output
 
-    Source 1 -> Source 2
-    Source 1 -> Source 3
-
-Input:
-    artifacts/normalized/*.parquet
-
-Output:
-    artifacts/candidates/*.parquet
-    artifacts/candidates/*.metadata.json
-
-Designed for:
-    8 vCPU
-    64 GB RAM
-    Polars
-    Parquet
+Important:
+- Uses Polars lazy scanning.
+- Processes one blocking rule at a time.
+- Does not build the full Cartesian product.
+- Preserves block provenance.
+- Uses source-specific candidate outputs.
 """
 
 from __future__ import annotations
 
-import gc
-import json
+import logging
 import os
 import time
 from pathlib import Path
+from typing import Dict, List
 
 import polars as pl
-import psutil
 
 
 # ============================================================
-# RESOURCE MONITOR
+# CONSTANTS
 # ============================================================
 
-PROCESS = psutil.Process(os.getpid())
+ENTITY_COL = "entity_id"
 
-
-def process_ram_gb() -> float:
-    return PROCESS.memory_info().rss / (1024 ** 3)
-
-
-def system_ram_gb() -> tuple[float, float]:
-    mem = psutil.virtual_memory()
-
-    used = mem.used / (1024 ** 3)
-    available = mem.available / (1024 ** 3)
-
-    return used, available
-
-
-def print_resource_status(prefix: str = "") -> None:
-    used, available = system_ram_gb()
-
-    print(
-        f"{prefix}"
-        f"Process RAM: {process_ram_gb():.2f} GB | "
-        f"System used: {used:.2f} GB | "
-        f"Available: {available:.2f} GB"
-    )
+LOGGER = logging.getLogger(__name__)
 
 
 # ============================================================
 # BLOCKING CONFIGURATION
 # ============================================================
-
-ENTITY_COL = "entity_id"
 
 BLOCKS = [
     {
@@ -89,12 +61,12 @@ BLOCKS = [
         "maximum_bucket": 1000,
     },
     {
-        "key": "_k_exact_name",
+        "key": "_k_name_prefix6",
         "name": "name_prefix6",
         "maximum_bucket": 500,
     },
     {
-        "key": "_k_exact_name",
+        "key": "_k_name_prefix4",
         "name": "name_prefix4",
         "maximum_bucket": 250,
     },
@@ -106,6 +78,10 @@ BLOCKS = [
 ]
 
 
+# ============================================================
+# REQUIRED NORMALIZED COLUMNS
+# ============================================================
+
 REQUIRED_COLUMNS = [
     ENTITY_COL,
     "business_name_compact",
@@ -116,60 +92,39 @@ REQUIRED_COLUMNS = [
 
 
 # ============================================================
-# INPUT VALIDATION
+# NORMALIZED DATA LOADER
 # ============================================================
 
-def validate_normalized_file(path: Path) -> Path:
+def load_normalized(path: str | Path) -> pl.LazyFrame:
     """
-    Verify that a normalized Parquet file exists and is non-empty.
+    Load normalized parquet data lazily and create blocking keys.
+
+    Parameters
+    ----------
+    path:
+        Path to normalized parquet file.
+
+    Returns
+    -------
+    pl.LazyFrame
+        LazyFrame containing entity_id and all blocking keys.
     """
 
     path = Path(path)
 
     if not path.exists():
         raise FileNotFoundError(
-            f"\nNormalized file not found:\n"
-            f"  {path}\n"
+            f"Normalized parquet file not found: {path}"
         )
-
-    if path.stat().st_size == 0:
-        raise ValueError(
-            f"\nNormalized file is empty:\n"
-            f"  {path}\n"
-        )
-
-    return path
-
-
-# ============================================================
-# DATA LOADING
-# ============================================================
-
-def load_normalized(path: Path) -> pl.LazyFrame:
-    """
-    Lazily load normalized Parquet and create the six
-    blocking keys required by the candidate generator.
-    """
-
-    path = validate_normalized_file(path)
-
-    print()
-    print("Loading normalized file:")
-    print(f"  {path}")
 
     return (
         pl.scan_parquet(path)
-        .select(
-            [
-                ENTITY_COL,
-                "business_name_compact",
-                "business_address_compact",
-                "business_name_sorted_tokens",
-                "business_address_numeric_tokens",
-            ]
-        )
+        .select(REQUIRED_COLUMNS)
         .with_columns(
             [
+                # ------------------------------------------------
+                # Prefix blocking keys
+                # ------------------------------------------------
                 pl.col("business_name_compact")
                 .str.slice(0, 6)
                 .alias("_k_name_prefix6"),
@@ -181,6 +136,9 @@ def load_normalized(path: Path) -> pl.LazyFrame:
         )
         .with_columns(
             [
+                # ------------------------------------------------
+                # Exact / derived blocking keys
+                # ------------------------------------------------
                 pl.col("business_name_compact")
                 .alias("_k_exact_name"),
 
@@ -209,142 +167,150 @@ def load_normalized(path: Path) -> pl.LazyFrame:
 
 
 # ============================================================
-# SINGLE BLOCK
+# BLOCK KEY VALIDATION
 # ============================================================
 
-def make_block(
-    s1: pl.LazyFrame,
-    candidate: pl.LazyFrame,
+def validate_block_keys(lf: pl.LazyFrame) -> None:
+    """
+    Validate that all configured blocking keys exist.
+    """
+
+    schema = lf.collect_schema()
+    available_columns = set(schema.names())
+
+    missing = []
+
+    for block in BLOCKS:
+        key = block["key"]
+
+        if key not in available_columns:
+            missing.append(key)
+
+    if missing:
+        raise ValueError(
+            "Missing blocking keys: "
+            + ", ".join(sorted(set(missing)))
+        )
+
+
+# ============================================================
+# BLOCK SIZE FILTER
+# ============================================================
+
+def filter_block_sizes(
+    lf: pl.LazyFrame,
     key: str,
-    block_name: str,
     maximum_bucket: int,
+) -> pl.LazyFrame:
+    """
+    Remove oversized blocking buckets.
+
+    Very common values such as empty strings or generic prefixes
+    can create extremely large candidate sets. Such buckets are
+    excluded before joining.
+    """
+
+    valid_keys = (
+        lf
+        .filter(
+            pl.col(key).is_not_null()
+            & (pl.col(key).str.len_chars() > 0)
+        )
+        .group_by(key)
+        .agg(
+            pl.len().alias("_block_size")
+        )
+        .filter(
+            pl.col("_block_size") <= maximum_bucket
+        )
+        .select(key)
+    )
+
+    return lf.join(
+        valid_keys,
+        on=key,
+        how="semi",
+    )
+
+
+# ============================================================
+# SINGLE BLOCK GENERATION
+# ============================================================
+
+def generate_block_candidates(
+    source1: pl.LazyFrame,
+    source2: pl.LazyFrame,
+    block: Dict,
 ) -> pl.LazyFrame:
     """
     Generate candidate pairs for one blocking rule.
 
-    Large buckets are discarded to prevent candidate explosion.
+    Output columns:
+        source1_entity_id
+        candidate_entity_id
+        candidate_source
+        block_support_count
+        blocks
     """
 
-    # --------------------------------------------------------
-    # LEFT / SOURCE 1
-    # --------------------------------------------------------
+    key = block["key"]
+    block_name = block["name"]
+    maximum_bucket = block["maximum_bucket"]
 
-    left = (
-        s1
-        .select(
-            [
-                pl.col(ENTITY_COL).alias(
-                    "source1_entity_id"
-                ),
-                pl.col(key),
-            ]
-        )
-        .filter(
-            pl.col(key).is_not_null()
-            & (pl.col(key) != "")
-            & (pl.col(key).str.len_chars() > 2)
-        )
+    LOGGER.info(
+        "Generating block: %s | key=%s | max_bucket=%s",
+        block_name,
+        key,
+        maximum_bucket,
     )
 
     # --------------------------------------------------------
-    # RIGHT / CANDIDATE SOURCE
+    # Filter oversized buckets independently on both sides.
     # --------------------------------------------------------
 
-    right = (
-        candidate
-        .select(
-            [
-                pl.col(ENTITY_COL).alias(
-                    "candidate_entity_id"
-                ),
-                pl.col(key),
-            ]
-        )
-        .filter(
-            pl.col(key).is_not_null()
-            & (pl.col(key) != "")
-            & (pl.col(key).str.len_chars() > 2)
-        )
+    s1 = filter_block_sizes(
+        source1,
+        key,
+        maximum_bucket,
+    )
+
+    s2 = filter_block_sizes(
+        source2,
+        key,
+        maximum_bucket,
     )
 
     # --------------------------------------------------------
-    # SAFE BUCKETS — SOURCE 1
+    # Rename entity IDs before join.
     # --------------------------------------------------------
 
-    left_keys = (
-        left
-        .group_by(key)
-        .len(name="_left_count")
-        .filter(
-            pl.col("_left_count")
-            <= maximum_bucket
-        )
-        .select(key)
+    s1 = s1.select(
+        [
+            pl.col(ENTITY_COL).alias("source1_entity_id"),
+            key,
+        ]
+    )
+
+    s2 = s2.select(
+        [
+            pl.col(ENTITY_COL).alias("candidate_entity_id"),
+            key,
+        ]
     )
 
     # --------------------------------------------------------
-    # SAFE BUCKETS — CANDIDATE SOURCE
+    # Inner join on blocking key.
     # --------------------------------------------------------
 
-    right_keys = (
-        right
-        .group_by(key)
-        .len(name="_right_count")
-        .filter(
-            pl.col("_right_count")
-            <= maximum_bucket
-        )
-        .select(key)
-    )
-
-    # --------------------------------------------------------
-    # ONLY KEYS PRESENT ON BOTH SIDES
-    # --------------------------------------------------------
-
-    safe_keys = (
-        left_keys
-        .join(
-            right_keys,
+    candidates = (
+        s1.join(
+            s2,
             on=key,
             how="inner",
         )
-        .select(key)
-    )
-
-    # --------------------------------------------------------
-    # REDUCE BOTH SIDES BEFORE MANY-TO-MANY JOIN
-    # --------------------------------------------------------
-
-    left = (
-        left
-        .join(
-            safe_keys,
-            on=key,
-            how="inner",
-        )
-    )
-
-    right = (
-        right
-        .join(
-            safe_keys,
-            on=key,
-            how="inner",
-        )
-    )
-
-    # --------------------------------------------------------
-    # MANY-TO-MANY CANDIDATE JOIN
-    # --------------------------------------------------------
-
-    return (
-        left
-        .join(
-            right,
-            on=key,
-            how="inner",
-            validate="m:m",
-            coalesce=True,
+        .filter(
+            pl.col("source1_entity_id")
+            != pl.col("candidate_entity_id")
         )
         .select(
             [
@@ -353,190 +319,250 @@ def make_block(
             ]
         )
         .with_columns(
-            pl.lit(block_name).alias("block")
+            [
+                pl.lit(block_name)
+                .alias("block_name"),
+            ]
         )
     )
 
+    return candidates
+
 
 # ============================================================
-# CANDIDATE GENERATION
+# BLOCK-BY-BLOCK CANDIDATE WRITER
 # ============================================================
 
 def generate_candidates(
-    source1_path: Path,
-    candidate_source_path: Path,
-    output_path: Path,
+    source1_path: str | Path,
+    source2_path: str | Path,
+    output_path: str | Path,
     candidate_source: str,
-) -> dict:
+) -> Dict:
     """
-    Generate candidate pairs.
+    Generate memory-safe candidate pairs.
+
+    Each blocking rule is processed independently and written
+    to temporary parquet files. Final candidates are then
+    deduplicated while preserving block provenance.
 
     Parameters
     ----------
     source1_path:
-        Normalized Source 1 Parquet.
+        Normalized Source 1 parquet.
 
-    candidate_source_path:
-        Normalized Source 2 or Source 3 Parquet.
+    source2_path:
+        Normalized Source 2 or Source 3 parquet.
 
     output_path:
-        Candidate Parquet output.
+        Final candidate parquet.
 
     candidate_source:
-        "S2" or "S3".
+        Candidate source label, e.g. "S2" or "S3".
+
+    Returns
+    -------
+    dict
+        Generation statistics.
     """
 
-    source1_path = validate_normalized_file(
-        Path(source1_path)
-    )
+    start_time = time.time()
 
-    candidate_source_path = validate_normalized_file(
-        Path(candidate_source_path)
-    )
-
+    source1_path = Path(source1_path)
+    source2_path = Path(source2_path)
     output_path = Path(output_path)
 
-    print()
-    print("=" * 80)
-    print(
-        f"BLOCKING: S1 -> {candidate_source}"
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    print("=" * 80)
-
-    print(f"S1:")
-    print(f"  {source1_path}")
-
-    print(f"Candidate source:")
-    print(f"  {candidate_source_path}")
-
-    print(f"Output:")
-    print(f"  {output_path}")
-
-    overall_start = time.time()
-
-    print_resource_status("Initial: ")
 
     # --------------------------------------------------------
-    # LOAD
+    # Temporary directory
     # --------------------------------------------------------
 
-    s1 = load_normalized(
-        source1_path
+    temp_dir = output_path.parent / (
+        f".{output_path.stem}_blocks"
     )
 
-    candidate = load_normalized(
-        candidate_source_path
+    temp_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    results = []
-    block_stats = []
+    LOGGER.info("=" * 70)
+    LOGGER.info("Candidate generation")
+    LOGGER.info("=" * 70)
+    LOGGER.info("Source 1: %s", source1_path)
+    LOGGER.info("Source 2: %s", source2_path)
+    LOGGER.info("Candidate source: %s", candidate_source)
+    LOGGER.info("Output: %s", output_path)
 
-    # ========================================================
-    # RUN SIX BLOCKS
-    # ========================================================
+    # --------------------------------------------------------
+    # Load lazily
+    # --------------------------------------------------------
 
-    for config in BLOCKS:
+    source1 = load_normalized(source1_path)
+    source2 = load_normalized(source2_path)
 
-        key = config["key"]
-        block_name = config["name"]
-        maximum_bucket = config["maximum_bucket"]
+    validate_block_keys(source1)
+    validate_block_keys(source2)
 
-        print()
-        print("-" * 80)
-        print(f"BLOCK: {block_name}")
-        print(f"KEY: {key}")
-        print(
-            f"MAX BUCKET: "
-            f"{maximum_bucket:,}"
-        )
-        print("-" * 80)
+    # --------------------------------------------------------
+    # Generate every block independently
+    # --------------------------------------------------------
 
-        print_resource_status(
-            "Before: "
-        )
+    block_files: List[Path] = []
+    block_statistics = {}
 
-        start = time.time()
+    for block_index, block in enumerate(BLOCKS):
 
-        block = make_block(
-            s1=s1,
-            candidate=candidate,
-            key=key,
-            block_name=block_name,
-            maximum_bucket=maximum_bucket,
-        )
+        block_name = block["name"]
 
-        # Materialize this block.
-        block_df = block.collect(
-            engine="streaming"
+        block_start = time.time()
+
+        LOGGER.info(
+            "\n[%d/%d] BLOCK: %s",
+            block_index + 1,
+            len(BLOCKS),
+            block_name,
         )
 
-        elapsed = (
-            time.time() - start
+        candidates = generate_block_candidates(
+            source1=source1,
+            source2=source2,
+            block=block,
         )
 
-        candidate_count = len(
-            block_df
+        temp_file = (
+            temp_dir
+            / f"block_{block_index:02d}_{block_name}.parquet"
         )
 
-        print(
-            f"Candidates: "
-            f"{candidate_count:,}"
-        )
+        # ----------------------------------------------------
+        # Collect ONLY this block.
+        # ----------------------------------------------------
 
-        print(
-            f"Runtime: "
-            f"{elapsed:.2f} sec"
-        )
+        block_df = candidates.collect()
 
-        print_resource_status(
-            "After:  "
-        )
+        row_count = block_df.height
 
-        block_stats.append(
-            {
-                "block": block_name,
-                "key": key,
-                "maximum_bucket":
-                    maximum_bucket,
-                "candidate_count":
-                    candidate_count,
-                "runtime_seconds":
-                    elapsed,
-                "process_ram_gb":
-                    process_ram_gb(),
-            }
-        )
+        # ----------------------------------------------------
+        # Save block
+        # ----------------------------------------------------
 
-        results.append(
-            block_df.lazy()
+        if row_count > 0:
+
+            block_df.write_parquet(
+                temp_file,
+                compression="zstd",
+            )
+
+            block_files.append(temp_file)
+
+        block_runtime = time.time() - block_start
+
+        block_statistics[block_name] = {
+            "rows": row_count,
+            "runtime_seconds": round(
+                block_runtime,
+                2,
+            ),
+            "temporary_file": str(temp_file),
+        }
+
+        LOGGER.info(
+            "Block %s: %,d candidates | %.2f sec",
+            block_name,
+            row_count,
+            block_runtime,
         )
 
         del block_df
-        gc.collect()
+
+    # --------------------------------------------------------
+    # No candidates
+    # --------------------------------------------------------
+
+    if not block_files:
+
+        empty_df = pl.DataFrame(
+            {
+                "source1_entity_id": pl.Series(
+                    [],
+                    dtype=pl.String,
+                ),
+                "candidate_entity_id": pl.Series(
+                    [],
+                    dtype=pl.String,
+                ),
+                "candidate_source": pl.Series(
+                    [],
+                    dtype=pl.String,
+                ),
+                "block_support_count": pl.Series(
+                    [],
+                    dtype=pl.UInt32,
+                ),
+                "blocks": pl.Series(
+                    [],
+                    dtype=pl.List(pl.String),
+                ),
+            }
+        )
+
+        empty_df.write_parquet(
+            output_path,
+            compression="zstd",
+        )
+
+        return {
+            "candidate_source": candidate_source,
+            "raw_candidates": 0,
+            "final_candidates": 0,
+            "duplicate_reduction_percent": 0.0,
+            "runtime_seconds": round(
+                time.time() - start_time,
+                2,
+            ),
+            "blocks": block_statistics,
+        }
 
     # ========================================================
-    # UNION
+    # FINAL DEDUPLICATION
     # ========================================================
 
-    print()
-    print("=" * 80)
-    print("UNION + DEDUPLICATION")
-    print("=" * 80)
+    LOGGER.info("\nCombining block files...")
 
-    union_start = time.time()
+    # --------------------------------------------------------
+    # Scan all temporary block files lazily.
+    # --------------------------------------------------------
 
-    all_candidates = pl.concat(
-        results,
-        how="vertical",
+    combined = pl.scan_parquet(
+        [str(path) for path in block_files]
+    )
+
+    raw_candidates = (
+        combined
+        .select(pl.len())
+        .collect()
+        .item()
+    )
+
+    LOGGER.info(
+        "Raw block candidates: %,d",
+        raw_candidates,
     )
 
     # --------------------------------------------------------
-    # Deduplicate candidate pairs.
-    # Keep how many blocking rules produced each pair.
+    # Aggregate duplicate candidate pairs.
+    #
+    # One pair may be found through multiple blocking rules.
+    # Preserve all block names as provenance.
     # --------------------------------------------------------
 
     final_candidates = (
-        all_candidates
+        combined
         .group_by(
             [
                 "source1_entity_id",
@@ -545,21 +571,22 @@ def generate_candidates(
         )
         .agg(
             [
-                pl.col("block")
+                pl.col("block_name")
                 .n_unique()
-                .alias(
-                    "block_support_count"
-                ),
+                .cast(pl.UInt32)
+                .alias("block_support_count"),
 
-                pl.col("block")
+                pl.col("block_name")
                 .unique()
                 .sort()
                 .alias("blocks"),
             ]
         )
         .with_columns(
-            pl.lit(candidate_source)
-            .alias("candidate_source")
+            [
+                pl.lit(candidate_source)
+                .alias("candidate_source"),
+            ]
         )
         .select(
             [
@@ -573,298 +600,191 @@ def generate_candidates(
     )
 
     # --------------------------------------------------------
-    # Materialize final candidate set
+    # Collect final result and write parquet.
     # --------------------------------------------------------
 
-    final_df = final_candidates.collect(
-        engine="streaming"
-    )
+    final_df = final_candidates.collect()
 
-    union_elapsed = (
-        time.time() - union_start
-    )
-
-    final_count = len(
-        final_df
-    )
-
-    raw_candidate_count = sum(
-        x["candidate_count"]
-        for x in block_stats
-    )
-
-    duplicate_reduction = (
-        1.0
-        - (
-            final_count
-            / raw_candidate_count
-        )
-        if raw_candidate_count > 0
-        else 0.0
-    )
-
-    print(
-        f"Raw block candidates: "
-        f"{raw_candidate_count:,}"
-    )
-
-    print(
-        f"Final unique candidates: "
-        f"{final_count:,}"
-    )
-
-    print(
-        f"Duplicate reduction: "
-        f"{duplicate_reduction * 100:.2f}%"
-    )
-
-    print(
-        f"Union runtime: "
-        f"{union_elapsed:.2f} sec"
-    )
-
-    print_resource_status(
-        "After union: "
-    )
-
-    # ========================================================
-    # WRITE PARQUET
-    # ========================================================
-
-    print()
-    print("=" * 80)
-    print("WRITING CANDIDATE PARQUET")
-    print("=" * 80)
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    if output_path.exists():
-        print(
-            f"Removing existing output:"
-        )
-        print(
-            f"  {output_path}"
-        )
-
-        output_path.unlink()
-
-    write_start = time.time()
+    final_count = final_df.height
 
     final_df.write_parquet(
         output_path,
         compression="zstd",
-        compression_level=3,
     )
 
-    write_elapsed = (
-        time.time() - write_start
+    # --------------------------------------------------------
+    # Statistics
+    # --------------------------------------------------------
+
+    duplicate_reduction = (
+        (
+            raw_candidates - final_count
+        )
+        / raw_candidates
+        * 100
+        if raw_candidates > 0
+        else 0.0
     )
 
-    output_size_bytes = (
-        output_path.stat().st_size
+    runtime = time.time() - start_time
+
+    LOGGER.info(
+        "\nFinal candidates: %,d",
+        final_count,
     )
 
-    output_size_gb = (
-        output_size_bytes
-        / (1024 ** 3)
+    LOGGER.info(
+        "Duplicate reduction: %.2f%%",
+        duplicate_reduction,
     )
 
-    print(
-        f"Output written:"
-    )
-    print(
-        f"  {output_path}"
+    LOGGER.info(
+        "Runtime: %.2f sec",
+        runtime,
     )
 
-    print(
-        f"Output size: "
-        f"{output_size_gb:.2f} GB"
+    LOGGER.info(
+        "Output: %s",
+        output_path,
     )
 
-    print(
-        f"Write runtime: "
-        f"{write_elapsed:.2f} sec"
-    )
+    # --------------------------------------------------------
+    # Cleanup temporary files
+    # --------------------------------------------------------
 
-    # ========================================================
-    # FINAL SUMMARY
-    # ========================================================
+    for block_file in block_files:
 
-    total_elapsed = (
-        time.time() - overall_start
-    )
+        try:
+            block_file.unlink()
+        except OSError as exc:
+            LOGGER.warning(
+                "Could not remove temporary file %s: %s",
+                block_file,
+                exc,
+            )
 
-    print()
-    print("=" * 80)
-    print("BLOCKING COMPLETE")
-    print("=" * 80)
+    try:
+        temp_dir.rmdir()
+    except OSError:
+        pass
 
-    print(
-        f"Candidate source: "
-        f"{candidate_source}"
-    )
-
-    print(
-        f"Raw block candidates: "
-        f"{raw_candidate_count:,}"
-    )
-
-    print(
-        f"Final unique candidates: "
-        f"{final_count:,}"
-    )
-
-    print(
-        f"Total runtime: "
-        f"{total_elapsed:.2f} sec"
-    )
-
-    print_resource_status(
-        "Final: "
-    )
-
-    # ========================================================
-    # METADATA
-    # ========================================================
-
-    metadata = {
-        "stage":
-            "03_candidate_generation",
-
-        "source1_path":
-            str(source1_path),
-
-        "candidate_source":
-            candidate_source,
-
-        "candidate_source_path":
-            str(candidate_source_path),
-
-        "output_path":
-            str(output_path),
-
-        "blocks":
-            block_stats,
-
-        "raw_block_candidate_total":
-            raw_candidate_count,
-
-        "final_unique_candidates":
-            final_count,
-
-        "duplicate_reduction":
+    return {
+        "candidate_source": candidate_source,
+        "raw_candidates": int(raw_candidates),
+        "final_candidates": int(final_count),
+        "duplicate_reduction_percent": round(
             duplicate_reduction,
-
-        "union_runtime_seconds":
-            union_elapsed,
-
-        "write_runtime_seconds":
-            write_elapsed,
-
-        "total_runtime_seconds":
-            total_elapsed,
-
-        "output_size_bytes":
-            output_size_bytes,
-
-        "output_size_gb":
-            output_size_gb,
-
-        "final_process_ram_gb":
-            process_ram_gb(),
+            2,
+        ),
+        "runtime_seconds": round(
+            runtime,
+            2,
+        ),
+        "blocks": block_statistics,
+        "output_path": str(output_path),
     }
-
-    metadata_path = (
-        output_path.with_suffix(
-            ".metadata.json"
-        )
-    )
-
-    with open(
-        metadata_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            metadata,
-            f,
-            indent=2,
-        )
-
-    print()
-    print(
-        f"Metadata:"
-    )
-    print(
-        f"  {metadata_path}"
-    )
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
-
-    del final_df
-    del final_candidates
-    del all_candidates
-    del results
-    del s1
-    del candidate
-
-    gc.collect()
-
-    return metadata
 
 
 # ============================================================
-# COMMAND LINE SUPPORT
+# CONVENIENCE FUNCTIONS
+# ============================================================
+
+def generate_train_s1_s2_candidates(
+    train_s1_path: str | Path,
+    train_s2_path: str | Path,
+    output_path: str | Path,
+) -> Dict:
+
+    return generate_candidates(
+        source1_path=train_s1_path,
+        source2_path=train_s2_path,
+        output_path=output_path,
+        candidate_source="S2",
+    )
+
+
+def generate_train_s1_s3_candidates(
+    train_s1_path: str | Path,
+    train_s3_path: str | Path,
+    output_path: str | Path,
+) -> Dict:
+
+    return generate_candidates(
+        source1_path=train_s1_path,
+        source2_path=train_s3_path,
+        output_path=output_path,
+        candidate_source="S3",
+    )
+
+
+def generate_test_s1_s2_candidates(
+    test_s1_path: str | Path,
+    test_s2_path: str | Path,
+    output_path: str | Path,
+) -> Dict:
+
+    return generate_candidates(
+        source1_path=test_s1_path,
+        source2_path=test_s2_path,
+        output_path=output_path,
+        candidate_source="S2",
+    )
+
+
+def generate_test_s1_s3_candidates(
+    test_s1_path: str | Path,
+    test_s3_path: str | Path,
+    output_path: str | Path,
+) -> Dict:
+
+    return generate_candidates(
+        source1_path=test_s1_path,
+        source2_path=test_s3_path,
+        output_path=output_path,
+        candidate_source="S3",
+    )
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def configure_logging() -> None:
+    """
+    Configure console logging when this module is executed
+    directly or imported by a script that has not configured
+    logging.
+    """
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+    )
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
-    import argparse
+    configure_logging()
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Amazon ML Challenge 2026 "
-            "candidate generation"
+    LOGGER.info(
+        "Blocking module loaded successfully."
+    )
+
+    LOGGER.info(
+        "Configured blocking rules:"
+    )
+
+    for block in BLOCKS:
+        LOGGER.info(
+            "  %-20s -> %s",
+            block["name"],
+            block["key"],
         )
-    )
-
-    parser.add_argument(
-        "--source1",
-        required=True,
-        type=Path,
-    )
-
-    parser.add_argument(
-        "--candidate-source",
-        required=True,
-        type=Path,
-    )
-
-    parser.add_argument(
-        "--candidate-label",
-        required=True,
-        choices=["S2", "S3"],
-    )
-
-    parser.add_argument(
-        "--output",
-        required=True,
-        type=Path,
-    )
-
-    args = parser.parse_args()
-
-    generate_candidates(
-        source1_path=args.source1,
-        candidate_source_path=(
-            args.candidate_source
-        ),
-        output_path=args.output,
-        candidate_source=args.candidate_label,
-    )
