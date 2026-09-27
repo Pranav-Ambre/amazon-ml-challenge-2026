@@ -1,15 +1,7 @@
 """
-Full-dataset candidate generation.
+Full-dataset memory-safe candidate generation.
 
-Processes:
-
-    TRAIN:
-        S1 → S2
-        S1 → S3
-
-    TEST:
-        S1 → S2
-        S1 → S3
+Every blocking rule is written independently.
 """
 
 from __future__ import annotations
@@ -35,7 +27,7 @@ from code.business_entity_resolution.src.blocking import (
 
 
 # ============================================================
-# Paths
+# Directories
 # ============================================================
 
 NORMALIZED_DIR = (
@@ -44,143 +36,85 @@ NORMALIZED_DIR = (
     / "normalized"
 )
 
-CANDIDATE_DIR = (
+CANDIDATES_DIR = (
     ROOT
     / "artifacts"
     / "candidates"
 )
 
-CANDIDATE_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
 
 # ============================================================
-# Complete dataset
+# Dataset jobs
 # ============================================================
 
-DATASETS = [
+JOBS = [
 
-    # --------------------------------------------------------
-    # TRAIN S1 → S2
-    # --------------------------------------------------------
+    (
+        "train_s1_s2",
 
-    {
-        "name": "TRAIN S1 -> S2",
+        NORMALIZED_DIR
+        / "train_source1_normalized.parquet",
 
-        "source1": (
-            NORMALIZED_DIR
-            / "train_source1_normalized.parquet"
-        ),
+        NORMALIZED_DIR
+        / "train_source2_normalized.parquet",
+    ),
 
-        "source2": (
-            NORMALIZED_DIR
-            / "train_source2_normalized.parquet"
-        ),
+    (
+        "train_s1_s3",
 
-        "output": (
-            CANDIDATE_DIR
-            / "train_s1_s2_candidates.parquet"
-        ),
-    },
+        NORMALIZED_DIR
+        / "train_source1_normalized.parquet",
 
-    # --------------------------------------------------------
-    # TRAIN S1 → S3
-    # --------------------------------------------------------
+        NORMALIZED_DIR
+        / "train_source3_normalized.parquet",
+    ),
 
-    {
-        "name": "TRAIN S1 -> S3",
+    (
+        "test_s1_s2",
 
-        "source1": (
-            NORMALIZED_DIR
-            / "train_source1_normalized.parquet"
-        ),
+        NORMALIZED_DIR
+        / "test_source1_normalized.parquet",
 
-        "source2": (
-            NORMALIZED_DIR
-            / "train_source3_normalized.parquet"
-        ),
+        NORMALIZED_DIR
+        / "test_source2_normalized.parquet",
+    ),
 
-        "output": (
-            CANDIDATE_DIR
-            / "train_s1_s3_candidates.parquet"
-        ),
-    },
+    (
+        "test_s1_s3",
 
-    # --------------------------------------------------------
-    # TEST S1 → S2
-    # --------------------------------------------------------
+        NORMALIZED_DIR
+        / "test_source1_normalized.parquet",
 
-    {
-        "name": "TEST S1 -> S2",
-
-        "source1": (
-            NORMALIZED_DIR
-            / "test_source1_normalized.parquet"
-        ),
-
-        "source2": (
-            NORMALIZED_DIR
-            / "test_source2_normalized.parquet"
-        ),
-
-        "output": (
-            CANDIDATE_DIR
-            / "test_s1_s2_candidates.parquet"
-        ),
-    },
-
-    # --------------------------------------------------------
-    # TEST S1 → S3
-    # --------------------------------------------------------
-
-    {
-        "name": "TEST S1 -> S3",
-
-        "source1": (
-            NORMALIZED_DIR
-            / "test_source1_normalized.parquet"
-        ),
-
-        "source2": (
-            NORMALIZED_DIR
-            / "test_source3_normalized.parquet"
-        ),
-
-        "output": (
-            CANDIDATE_DIR
-            / "test_s1_s3_candidates.parquet"
-        ),
-    },
+        NORMALIZED_DIR
+        / "test_source3_normalized.parquet",
+    ),
 ]
 
 
 # ============================================================
-# Validation
+# Validate
 # ============================================================
 
-def validate_inputs():
+def validate_files():
 
-    print("\nChecking normalized files...\n")
+    print()
+    print("=" * 80)
+    print("CHECKING INPUT FILES")
+    print("=" * 80)
 
-    for dataset in DATASETS:
+    for name, s1, s2 in JOBS:
 
-        source1 = dataset["source1"]
-        source2 = dataset["source2"]
-
-        if not source1.exists():
+        if not s1.exists():
             raise FileNotFoundError(
-                f"Missing S1 file:\n{source1}"
+                f"Missing:\n{s1}"
             )
 
-        if not source2.exists():
+        if not s2.exists():
             raise FileNotFoundError(
-                f"Missing candidate file:\n{source2}"
+                f"Missing:\n{s2}"
             )
 
-        print(f"✓ {source1.name}")
-        print(f"✓ {source2.name}")
+        print(f"✓ {name}")
 
 
 # ============================================================
@@ -189,28 +123,38 @@ def validate_inputs():
 
 def main():
 
-    validate_inputs()
+    validate_files()
+
+    CANDIDATES_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     overall_start = time.perf_counter()
 
     print()
     print("#" * 80)
-    print("# FULL DATASET CANDIDATE GENERATION")
+    print("# MEMORY-SAFE FULL DATASET CANDIDATE GENERATION")
     print("#" * 80)
 
-    for dataset in DATASETS:
+    for name, s1, s2 in JOBS:
 
         print()
         print("=" * 80)
-        print(dataset["name"])
+        print(name.upper())
         print("=" * 80)
 
         start = time.perf_counter()
 
+        output_dir = (
+            CANDIDATES_DIR
+            / name
+        )
+
         generate_candidates(
-            source1_path=dataset["source1"],
-            source2_path=dataset["source2"],
-            output_path=dataset["output"],
+            source1_path=s1,
+            source2_path=s2,
+            output_dir=output_dir,
         )
 
         elapsed = (
@@ -220,23 +164,20 @@ def main():
 
         print()
         print(
-            f"{dataset['name']} completed "
-            f"in {elapsed / 60:.2f} minutes"
+            f"{name} completed in "
+            f"{elapsed / 60:.2f} minutes"
         )
 
-    total_elapsed = (
+    total = (
         time.perf_counter()
         - overall_start
     )
 
     print()
     print("#" * 80)
+    print("FULL CANDIDATE GENERATION COMPLETED")
     print(
-        "ALL CANDIDATE GENERATION COMPLETED"
-    )
-    print(
-        f"Total time: "
-        f"{total_elapsed / 3600:.2f} hours"
+        f"Total time: {total / 3600:.2f} hours"
     )
     print("#" * 80)
 
