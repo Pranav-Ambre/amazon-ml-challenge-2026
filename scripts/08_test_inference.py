@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
+import json
 import time
 from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
 import polars as pl
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -23,43 +23,49 @@ MODEL_PATH = (
 NORM_DIR = ROOT / "artifacts/normalized"
 CAND_DIR = ROOT / "artifacts/candidates"
 OUT_DIR = ROOT / "artifacts/inference"
+REPORT_DIR = ROOT / "artifacts/reports"
 
-OUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 THRESHOLD = 0.80
 
-# Keep this reasonably small.
-# 1M rows is a good starting point for 64 GB RAM.
+# AWS instance has 64 GB RAM.
+# 1M candidate rows per batch is a reasonable starting point.
 BATCH_SIZE = 1_000_000
 
 
 # ============================================================
-# NORMALIZED FILES
+# FILES
 # ============================================================
+
+S1_NORMALIZED = (
+    NORM_DIR / "test_source1_normalized.parquet"
+)
 
 NORMALIZED_FILES = {
     "s2": NORM_DIR / "test_source2_normalized.parquet",
     "s3": NORM_DIR / "test_source3_normalized.parquet",
 }
 
-
 CANDIDATE_FILES = {
     "s2": CAND_DIR / "test_s1_s2_candidates.parquet",
     "s3": CAND_DIR / "test_s1_s3_candidates.parquet",
 }
-
 
 OUTPUT_FILES = {
     "s2": OUT_DIR / "test_scored_s2.parquet",
     "s3": OUT_DIR / "test_scored_s3.parquet",
 }
 
+REPORT_PATH = (
+    REPORT_DIR / "test_inference_report.json"
+)
+
 
 # ============================================================
-# FEATURES
+# MODEL FEATURES
+# MUST MATCH STAGE 05 EXACTLY
 # ============================================================
 
 FEATURE_COLUMNS = [
@@ -102,14 +108,23 @@ def token_overlap_expr(
     right_column,
     output_name,
 ):
+    """
+    Stage 05-compatible token overlap.
+
+    Normalized token columns are stored as space-separated
+    strings, not Polars List columns.
+    """
+
     return (
         pl.col(left_column)
         .fill_null("")
+        .cast(pl.Utf8)
         .str.strip_chars()
         .str.split(" ")
         .list.set_intersection(
             pl.col(right_column)
             .fill_null("")
+            .cast(pl.Utf8)
             .str.strip_chars()
             .str.split(" ")
         )
@@ -120,98 +135,224 @@ def token_overlap_expr(
 
 
 # ============================================================
-# FEATURE EXPRESSION
+# FEATURE GENERATION
 # ============================================================
 
 def make_features(
-    joined,
-    candidate_source,
-):
+    joined: pl.DataFrame,
+    candidate_source: str,
+) -> pl.DataFrame:
+
     return joined.select(
         [
+
+            # ==================================================
             # IDs
-            pl.col("source1_entity_id"),
-            pl.col("candidate_entity_id"),
+            # ==================================================
 
-            # Keep source
-            pl.lit(candidate_source)
-            .alias("candidate_source"),
+            pl.col(
+                "source1_entity_id"
+            ).cast(pl.Utf8),
 
-            # Exact name
+            pl.col(
+                "candidate_entity_id"
+            ).cast(pl.Utf8),
+
+            pl.lit(
+                candidate_source
+            ).alias("candidate_source"),
+
+
+            # ==================================================
+            # NAME FEATURES
+            # ==================================================
+
             (
-                pl.col("s1_business_name_norm")
-                == pl.col("candidate_business_name_norm")
+                pl.col(
+                    "s1_business_name_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_name_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("name_exact"),
 
+
             (
-                pl.col("s1_business_name_compact")
-                == pl.col("candidate_business_name_compact")
+                pl.col(
+                    "s1_business_name_compact"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_name_compact"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("name_compact_exact"),
 
+
             (
-                pl.col("s1_business_name_alnum")
-                == pl.col("candidate_business_name_alnum")
+                pl.col(
+                    "s1_business_name_alnum"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_name_alnum"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("name_alnum_exact"),
 
+
             (
-                pl.col("s1_business_name_sorted_tokens")
-                == pl.col("candidate_business_name_sorted_tokens")
+                pl.col(
+                    "s1_business_name_sorted_tokens"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_name_sorted_tokens"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("name_sorted_exact"),
 
-            # Exact address
+
+            # ==================================================
+            # ADDRESS FEATURES
+            # ==================================================
+
             (
-                pl.col("s1_business_address_norm")
-                == pl.col("candidate_business_address_norm")
+                pl.col(
+                    "s1_business_address_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_address_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("address_exact"),
 
+
             (
-                pl.col("s1_business_address_compact")
-                == pl.col("candidate_business_address_compact")
+                pl.col(
+                    "s1_business_address_compact"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_address_compact"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("address_compact_exact"),
 
+
             (
-                pl.col("s1_business_address_alnum")
-                == pl.col("candidate_business_address_alnum")
+                pl.col(
+                    "s1_business_address_alnum"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_address_alnum"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("address_alnum_exact"),
 
+
             (
-                pl.col("s1_business_address_sorted_tokens")
-                == pl.col("candidate_business_address_sorted_tokens")
+                pl.col(
+                    "s1_business_address_sorted_tokens"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_address_sorted_tokens"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("address_sorted_exact"),
 
-            # Country
+
+            # ==================================================
+            # COUNTRY
+            # ==================================================
+
             (
-                pl.col("s1_country_norm")
-                == pl.col("candidate_country_norm")
+                pl.col(
+                    "s1_country_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_country_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("country_exact"),
 
-            # House number
+
+            # ==================================================
+            # HOUSE NUMBER
+            # ==================================================
+
             (
-                pl.col("s1_business_address_house_number")
-                == pl.col("candidate_business_address_house_number")
+                pl.col(
+                    "s1_business_address_house_number"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                ==
+                pl.col(
+                    "candidate_business_address_house_number"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
             )
             .cast(pl.Int8)
             .alias("house_number_exact"),
 
-            # Token overlap
+
+            # ==================================================
+            # TOKEN OVERLAPS
+            # ==================================================
+
             token_overlap_expr(
                 "s1_business_address_postal_tokens",
                 "candidate_business_address_postal_tokens",
@@ -236,61 +377,125 @@ def make_features(
                 "address_token_overlap",
             ),
 
-            # Blocking support
-            pl.col("block_support_count")
-            .cast(pl.Int16)
-            .alias("block_support_count_feature"),
 
-            # Lengths
-            pl.col("s1_business_name_norm")
-            .fill_null("")
-            .str.len_chars()
+            # ==================================================
+            # BLOCK SUPPORT
+            # ==================================================
+
+            pl.col(
+                "block_support_count"
+            )
             .cast(pl.Int16)
+            .alias(
+                "block_support_count_feature"
+            ),
+
+
+            # ==================================================
+            # NAME LENGTHS
+            #
+            # Explicit Int32 conversion BEFORE subtraction.
+            # This prevents unsigned integer underflow.
+            # ==================================================
+
+            pl.col(
+                "s1_business_name_norm"
+            )
+            .fill_null("")
+            .cast(pl.Utf8)
+            .str.len_chars()
+            .cast(pl.Int32)
             .alias("s1_name_len"),
 
-            pl.col("candidate_business_name_norm")
+
+            pl.col(
+                "candidate_business_name_norm"
+            )
             .fill_null("")
+            .cast(pl.Utf8)
             .str.len_chars()
-            .cast(pl.Int16)
+            .cast(pl.Int32)
             .alias("s2_name_len"),
 
-            pl.col("s1_business_address_norm")
+
+            # ==================================================
+            # ADDRESS LENGTHS
+            # ==================================================
+
+            pl.col(
+                "s1_business_address_norm"
+            )
             .fill_null("")
+            .cast(pl.Utf8)
             .str.len_chars()
-            .cast(pl.Int16)
+            .cast(pl.Int32)
             .alias("s1_address_len"),
 
-            pl.col("candidate_business_address_norm")
+
+            pl.col(
+                "candidate_business_address_norm"
+            )
             .fill_null("")
+            .cast(pl.Utf8)
             .str.len_chars()
-            .cast(pl.Int16)
+            .cast(pl.Int32)
             .alias("s2_address_len"),
 
-            (
-                pl.col("s1_business_name_norm")
-                .fill_null("")
-                .str.len_chars()
-                -
-                pl.col("candidate_business_name_norm")
-                .fill_null("")
-                .str.len_chars()
-            )
-            .abs()
-            .cast(pl.Int16)
-            .alias("name_length_diff"),
+
+            # ==================================================
+            # NAME LENGTH DIFFERENCE
+            # ==================================================
 
             (
-                pl.col("s1_business_address_norm")
+                pl.col(
+                    "s1_business_name_norm"
+                )
                 .fill_null("")
+                .cast(pl.Utf8)
                 .str.len_chars()
+                .cast(pl.Int32)
                 -
-                pl.col("candidate_business_address_norm")
+                pl.col(
+                    "candidate_business_name_norm"
+                )
                 .fill_null("")
+                .cast(pl.Utf8)
                 .str.len_chars()
+                .cast(pl.Int32)
             )
             .abs()
             .cast(pl.Int16)
-            .alias("address_length_diff"),
+            .alias(
+                "name_length_diff"
+            ),
+
+
+            # ==================================================
+            # ADDRESS LENGTH DIFFERENCE
+            # ==================================================
+
+            (
+                pl.col(
+                    "s1_business_address_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                .str.len_chars()
+                .cast(pl.Int32)
+                -
+                pl.col(
+                    "candidate_business_address_norm"
+                )
+                .fill_null("")
+                .cast(pl.Utf8)
+                .str.len_chars()
+                .cast(pl.Int32)
+            )
+            .abs()
+            .cast(pl.Int16)
+            .alias(
+                "address_length_diff"
+            ),
         ]
     )
 
@@ -299,93 +504,268 @@ def make_features(
 # LOAD SOURCE 1
 # ============================================================
 
-print("=" * 70)
-print("STAGE 08 - TEST INFERENCE")
-print("=" * 70)
+def load_source1():
 
-start_time = time.time()
+    print("\nLoading normalized test Source 1...")
 
-print("\nLoading normalized Source 1...")
+    s1 = (
+        pl.read_parquet(
+            S1_NORMALIZED
+        )
+        .select(
+            [
+                pl.col("entity_id")
+                .cast(pl.Utf8)
+                .alias(
+                    "source1_entity_id"
+                ),
 
-s1_path = NORM_DIR / "test_source1_normalized.parquet"
+                pl.col("business_name_norm")
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_name_norm"
+                ),
 
-s1 = (
-    pl.read_parquet(s1_path)
-    .select(
-        [
-            pl.col("entity_id")
-            .alias("source1_entity_id"),
+                pl.col("business_name_compact")
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_name_compact"
+                ),
 
-            pl.col("business_name")
-            .alias("s1_business_name"),
+                pl.col("business_name_alnum")
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_name_alnum"
+                ),
 
-            pl.col("business_name_norm")
-            .alias("s1_business_name_norm"),
+                pl.col("business_name_tokens")
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_name_tokens"
+                ),
 
-            pl.col("business_name_compact")
-            .alias("s1_business_name_compact"),
+                pl.col(
+                    "business_name_sorted_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_name_sorted_tokens"
+                ),
 
-            pl.col("business_name_alnum")
-            .alias("s1_business_name_alnum"),
+                pl.col("business_address_norm")
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_norm"
+                ),
 
-            pl.col("business_name_tokens")
-            .alias("s1_business_name_tokens"),
+                pl.col(
+                    "business_address_compact"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_compact"
+                ),
 
-            pl.col("business_name_sorted_tokens")
-            .alias("s1_business_name_sorted_tokens"),
+                pl.col(
+                    "business_address_alnum"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_alnum"
+                ),
 
-            pl.col("business_address_norm")
-            .alias("s1_business_address_norm"),
+                pl.col(
+                    "business_address_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_tokens"
+                ),
 
-            pl.col("business_address_compact")
-            .alias("s1_business_address_compact"),
+                pl.col(
+                    "business_address_sorted_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_sorted_tokens"
+                ),
 
-            pl.col("business_address_alnum")
-            .alias("s1_business_address_alnum"),
+                pl.col(
+                    "business_address_house_number"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_house_number"
+                ),
 
-            pl.col("business_address_tokens")
-            .alias("s1_business_address_tokens"),
+                pl.col(
+                    "business_address_numeric_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_numeric_tokens"
+                ),
 
-            pl.col("business_address_sorted_tokens")
-            .alias("s1_business_address_sorted_tokens"),
+                pl.col(
+                    "business_address_postal_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_business_address_postal_tokens"
+                ),
 
-            pl.col("business_address_house_number")
-            .alias("s1_business_address_house_number"),
-
-            pl.col("business_address_numeric_tokens")
-            .alias("s1_business_address_numeric_tokens"),
-
-            pl.col("business_address_postal_tokens")
-            .alias("s1_business_address_postal_tokens"),
-
-            pl.col("country_norm")
-            .alias("s1_country_norm"),
-        ]
+                pl.col("country_norm")
+                .cast(pl.Utf8)
+                .alias(
+                    "s1_country_norm"
+                ),
+            ]
+        )
     )
-)
 
-print(
-    f"Source 1 rows: {s1.height:,}"
-)
+    print(
+        f"Source 1 rows: {s1.height:,}"
+    )
+
+    return s1
 
 
 # ============================================================
-# LOAD MODEL
+# LOAD TARGET SOURCE
 # ============================================================
 
-print("\nLoading LightGBM model...")
+def load_target_source(
+    source_name,
+):
 
-model = lgb.Booster(
-    model_file=str(MODEL_PATH)
-)
+    path = NORMALIZED_FILES[
+        source_name
+    ]
 
-print(
-    f"Model trees: {model.num_trees():,}"
-)
+    print(
+        f"\nLoading normalized "
+        f"{source_name.upper()}..."
+    )
 
-print(
-    f"Decision threshold: {THRESHOLD:.2f}"
-)
+    target = (
+        pl.read_parquet(path)
+        .select(
+            [
+                pl.col("entity_id")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_entity_id"
+                ),
+
+                pl.col("business_name_norm")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_name_norm"
+                ),
+
+                pl.col("business_name_compact")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_name_compact"
+                ),
+
+                pl.col("business_name_alnum")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_name_alnum"
+                ),
+
+                pl.col("business_name_tokens")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_name_tokens"
+                ),
+
+                pl.col(
+                    "business_name_sorted_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_name_sorted_tokens"
+                ),
+
+                pl.col("business_address_norm")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_norm"
+                ),
+
+                pl.col(
+                    "business_address_compact"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_compact"
+                ),
+
+                pl.col(
+                    "business_address_alnum"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_alnum"
+                ),
+
+                pl.col(
+                    "business_address_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_tokens"
+                ),
+
+                pl.col(
+                    "business_address_sorted_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_sorted_tokens"
+                ),
+
+                pl.col(
+                    "business_address_house_number"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_house_number"
+                ),
+
+                pl.col(
+                    "business_address_numeric_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_numeric_tokens"
+                ),
+
+                pl.col(
+                    "business_address_postal_tokens"
+                )
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_business_address_postal_tokens"
+                ),
+
+                pl.col("country_norm")
+                .cast(pl.Utf8)
+                .alias(
+                    "candidate_country_norm"
+                ),
+            ]
+        )
+    )
+
+    print(
+        f"{source_name.upper()} rows: "
+        f"{target.height:,}"
+    )
+
+    return target
 
 
 # ============================================================
@@ -397,100 +777,70 @@ def process_source(
     source1,
     model,
 ):
+
     print("\n" + "=" * 70)
-    print(f"PROCESSING TEST {source_name.upper()}")
+    print(
+        f"PROCESSING TEST "
+        f"{source_name.upper()}"
+    )
     print("=" * 70)
 
-    norm_path = NORMALIZED_FILES[source_name]
-    cand_path = CANDIDATE_FILES[source_name]
-    output_path = OUTPUT_FILES[source_name]
-
-    print(f"Candidate file: {cand_path}")
-    print(f"Normalized file: {norm_path}")
-    print(f"Output file: {output_path}")
-
-    # --------------------------------------------------------
-    # Load target normalized source
-    # --------------------------------------------------------
-
-    print("\nLoading target normalized source...")
-
-    target = pl.read_parquet(norm_path)
-
-    target = target.select(
-        [
-            pl.col("entity_id")
-            .alias("candidate_entity_id"),
-
-            pl.col("business_name_norm")
-            .alias("candidate_business_name_norm"),
-
-            pl.col("business_name_compact")
-            .alias("candidate_business_name_compact"),
-
-            pl.col("business_name_alnum")
-            .alias("candidate_business_name_alnum"),
-
-            pl.col("business_name_tokens")
-            .alias("candidate_business_name_tokens"),
-
-            pl.col("business_name_sorted_tokens")
-            .alias("candidate_business_name_sorted_tokens"),
-
-            pl.col("business_address_norm")
-            .alias("candidate_business_address_norm"),
-
-            pl.col("business_address_compact")
-            .alias("candidate_business_address_compact"),
-
-            pl.col("business_address_alnum")
-            .alias("candidate_business_address_alnum"),
-
-            pl.col("business_address_tokens")
-            .alias("candidate_business_address_tokens"),
-
-            pl.col("business_address_sorted_tokens")
-            .alias("candidate_business_address_sorted_tokens"),
-
-            pl.col("business_address_house_number")
-            .alias("candidate_business_address_house_number"),
-
-            pl.col("business_address_numeric_tokens")
-            .alias("candidate_business_address_numeric_tokens"),
-
-            pl.col("business_address_postal_tokens")
-            .alias("candidate_business_address_postal_tokens"),
-
-            pl.col("country_norm")
-            .alias("candidate_country_norm"),
+    candidate_path = (
+        CANDIDATE_FILES[
+            source_name
         ]
     )
 
-    print(
-        f"Target rows: {target.height:,}"
+    output_path = (
+        OUTPUT_FILES[
+            source_name
+        ]
     )
 
     # --------------------------------------------------------
-    # Candidate parquet reader
+    # Target source
     # --------------------------------------------------------
+
+    target = load_target_source(
+        source_name
+    )
+
+    # --------------------------------------------------------
+    # Candidate parquet
+    # --------------------------------------------------------
+
+    print(
+        "\nOpening candidate parquet..."
+    )
 
     parquet_file = pq.ParquetFile(
-        cand_path
+        candidate_path
     )
 
-    total_rows = parquet_file.metadata.num_rows
-
-    print(
-        f"Candidate rows: {total_rows:,}"
+    total_rows = (
+        parquet_file.metadata.num_rows
     )
 
     print(
-        f"Batch size: {BATCH_SIZE:,}"
+        f"Candidate rows: "
+        f"{total_rows:,}"
+    )
+
+    print(
+        f"Batch size: "
+        f"{BATCH_SIZE:,}"
     )
 
     # --------------------------------------------------------
-    # Output writer
+    # Delete old output
     # --------------------------------------------------------
+
+    if output_path.exists():
+        print(
+            f"\nRemoving old output: "
+            f"{output_path}"
+        )
+        output_path.unlink()
 
     writer = None
 
@@ -498,34 +848,42 @@ def process_source(
     total_predicted = 0
     batch_number = 0
 
-    if output_path.exists():
-        output_path.unlink()
-
     # --------------------------------------------------------
-    # Batch loop
+    # Process batches
     # --------------------------------------------------------
 
-    for batch in parquet_file.iter_batches(
+    for arrow_batch in parquet_file.iter_batches(
         batch_size=BATCH_SIZE
     ):
 
         batch_number += 1
 
-        candidates = pl.from_arrow(batch)
+        candidates = (
+            pl.from_arrow(
+                arrow_batch
+            )
+        )
 
-        # Ensure expected types
         candidates = candidates.select(
             [
-                pl.col("source1_entity_id")
+                pl.col(
+                    "source1_entity_id"
+                )
                 .cast(pl.Utf8),
 
-                pl.col("candidate_entity_id")
+                pl.col(
+                    "candidate_entity_id"
+                )
                 .cast(pl.Utf8),
 
-                pl.col("candidate_source")
+                pl.col(
+                    "candidate_source"
+                )
                 .cast(pl.Utf8),
 
-                pl.col("block_support_count")
+                pl.col(
+                    "block_support_count"
+                )
                 .cast(pl.UInt32),
 
                 pl.col("blocks"),
@@ -533,7 +891,7 @@ def process_source(
         )
 
         # ----------------------------------------------------
-        # Join S1
+        # Join Source 1
         # ----------------------------------------------------
 
         joined = candidates.join(
@@ -543,7 +901,7 @@ def process_source(
         )
 
         # ----------------------------------------------------
-        # Join S2/S3
+        # Join target source
         # ----------------------------------------------------
 
         joined = joined.join(
@@ -553,7 +911,7 @@ def process_source(
         )
 
         # ----------------------------------------------------
-        # Generate features
+        # Feature generation
         # ----------------------------------------------------
 
         feature_df = make_features(
@@ -562,19 +920,51 @@ def process_source(
         )
 
         # ----------------------------------------------------
+        # Sanity check
+        # ----------------------------------------------------
+
+        if batch_number == 1:
+
+            missing_features = [
+                col
+                for col in FEATURE_COLUMNS
+                if col not in feature_df.columns
+            ]
+
+            if missing_features:
+                raise RuntimeError(
+                    "Missing feature columns: "
+                    + str(
+                        missing_features
+                    )
+                )
+
+            print(
+                "\nFeature schema verified."
+            )
+
+        # ----------------------------------------------------
         # Model matrix
         # ----------------------------------------------------
 
-        X = feature_df.select(
-            FEATURE_COLUMNS
-        ).to_numpy()
-
-        probabilities = model.predict(
-            X
+        X = (
+            feature_df
+            .select(
+                FEATURE_COLUMNS
+            )
+            .to_numpy()
         )
 
         # ----------------------------------------------------
-        # Keep only predicted matches
+        # Predict
+        # ----------------------------------------------------
+
+        probabilities = (
+            model.predict(X)
+        )
+
+        # ----------------------------------------------------
+        # Apply threshold
         # ----------------------------------------------------
 
         keep = (
@@ -582,12 +972,22 @@ def process_source(
             >= THRESHOLD
         )
 
-        if keep.any():
+        if np.any(keep):
 
-            positive = feature_df.filter(
-                pl.Series(
-                    "keep",
-                    keep,
+            positive = (
+                feature_df
+                .filter(
+                    pl.Series(
+                        "keep",
+                        keep,
+                    )
+                )
+                .select(
+                    [
+                        "source1_entity_id",
+                        "candidate_entity_id",
+                        "candidate_source",
+                    ]
                 )
             )
 
@@ -596,40 +996,50 @@ def process_source(
                     "match_probability",
                     probabilities[keep],
                 )
+                .cast(pl.Float32)
             )
 
-            positive = positive.select(
-                [
-                    "source1_entity_id",
-                    "candidate_entity_id",
-                    "candidate_source",
-                    "match_probability",
-                ]
-            )
+            # ----------------------------------------------
+            # Write only positive matches
+            # ----------------------------------------------
 
-            arrow_table = positive.to_arrow()
+            arrow_table = (
+                positive.to_arrow()
+            )
 
             if writer is None:
-                writer = pq.ParquetWriter(
-                    output_path,
-                    arrow_table.schema,
-                    compression="zstd",
+
+                writer = (
+                    pq.ParquetWriter(
+                        output_path,
+                        arrow_table.schema,
+                        compression="zstd",
+                    )
                 )
 
             writer.write_table(
                 arrow_table
             )
 
-            total_predicted += positive.height
+            total_predicted += (
+                positive.height
+            )
 
-        total_processed += candidates.height
+        total_processed += (
+            candidates.height
+        )
+
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
 
         if (
             batch_number == 1
-            or batch_number % 10 == 0
+            or batch_number % 5 == 0
             or total_processed >= total_rows
         ):
-            pct = (
+
+            percentage = (
                 total_processed
                 / total_rows
                 * 100
@@ -637,20 +1047,28 @@ def process_source(
 
             print(
                 f"[{source_name}] "
-                f"batch={batch_number:,} "
-                f"processed={total_processed:,}/"
+                f"batch={batch_number:,} | "
+                f"processed="
+                f"{total_processed:,}/"
                 f"{total_rows:,} "
-                f"({pct:.1f}%) "
-                f"predicted={total_predicted:,}"
+                f"({percentage:.1f}%) | "
+                f"predicted="
+                f"{total_predicted:,}"
             )
+
+    # --------------------------------------------------------
+    # Close writer
+    # --------------------------------------------------------
 
     if writer is not None:
         writer.close()
 
-    print("\nCompleted:", source_name)
+    print(
+        f"\n{source_name.upper()} COMPLETE"
+    )
 
     print(
-        f"Processed candidates: "
+        f"Candidates processed: "
         f"{total_processed:,}"
     )
 
@@ -660,92 +1078,195 @@ def process_source(
     )
 
     print(
-        f"Output: {output_path}"
+        f"Output: "
+        f"{output_path}"
     )
 
     return {
         "source": source_name,
-        "candidate_rows": int(total_rows),
-        "processed_rows": int(total_processed),
-        "predicted_matches": int(total_predicted),
-        "output": str(output_path),
+        "candidate_rows": int(
+            total_rows
+        ),
+        "processed_rows": int(
+            total_processed
+        ),
+        "predicted_matches": int(
+            total_predicted
+        ),
+        "output_file": str(
+            output_path
+        ),
     }
 
 
 # ============================================================
-# RUN S2 + S3
+# MAIN
 # ============================================================
 
-results = []
+def main():
 
-results.append(
-    process_source(
-        "s2",
-        s1,
-        model,
-    )
-)
+    start_time = time.time()
 
-results.append(
-    process_source(
-        "s3",
-        s1,
-        model,
-    )
-)
+    print("=" * 70)
+    print("STAGE 08 - TEST INFERENCE")
+    print("=" * 70)
 
-
-# ============================================================
-# FINAL REPORT
-# ============================================================
-
-runtime = time.time() - start_time
-
-report = {
-    "stage": "08_test_inference",
-    "status": "complete",
-    "threshold": THRESHOLD,
-    "batch_size": BATCH_SIZE,
-    "model": str(MODEL_PATH),
-    "results": results,
-    "total_runtime_seconds": runtime,
-}
-
-report_path = (
-    ROOT
-    / "artifacts/reports/test_inference_report.json"
-)
-
-with open(
-    report_path,
-    "w",
-    encoding="utf-8",
-) as f:
-    import json
-
-    json.dump(
-        report,
-        f,
-        indent=2,
-    )
-
-print("\n" + "=" * 70)
-print("STAGE 08 COMPLETE")
-print("=" * 70)
-
-for result in results:
     print(
-        f"{result['source'].upper()}: "
-        f"{result['predicted_matches']:,} predicted matches"
+        f"Threshold: {THRESHOLD}"
     )
 
-print(
-    f"Runtime: {runtime:.2f} sec "
-    f"({runtime / 60:.2f} min)"
-)
+    print(
+        f"Batch size: {BATCH_SIZE:,}"
+    )
 
-print(
-    f"Report: {report_path}"
-)
+    # --------------------------------------------------------
+    # Check files
+    # --------------------------------------------------------
 
-print("=" * 70)
+    required_files = [
+        MODEL_PATH,
+        S1_NORMALIZED,
+        NORMALIZED_FILES["s2"],
+        NORMALIZED_FILES["s3"],
+        CANDIDATE_FILES["s2"],
+        CANDIDATE_FILES["s3"],
+    ]
+
+    for path in required_files:
+
+        if not path.exists():
+
+            raise FileNotFoundError(
+                f"Required file not found: "
+                f"{path}"
+            )
+
+    # --------------------------------------------------------
+    # Load model
+    # --------------------------------------------------------
+
+    print(
+        "\nLoading LightGBM model..."
+    )
+
+    model = lgb.Booster(
+        model_file=str(
+            MODEL_PATH
+        )
+    )
+
+    print(
+        f"Model trees: "
+        f"{model.num_trees():,}"
+    )
+
+    # --------------------------------------------------------
+    # Load S1 once
+    # --------------------------------------------------------
+
+    source1 = load_source1()
+
+    # --------------------------------------------------------
+    # S2
+    # --------------------------------------------------------
+
+    result_s2 = process_source(
+        "s2",
+        source1,
+        model,
+    )
+
+    # --------------------------------------------------------
+    # S3
+    # --------------------------------------------------------
+
+    result_s3 = process_source(
+        "s3",
+        source1,
+        model,
+    )
+
+    # --------------------------------------------------------
+    # Report
+    # --------------------------------------------------------
+
+    runtime = (
+        time.time()
+        - start_time
+    )
+
+    report = {
+        "stage": "08_test_inference",
+        "status": "complete",
+        "threshold": THRESHOLD,
+        "batch_size": BATCH_SIZE,
+        "model": str(
+            MODEL_PATH
+        ),
+        "results": [
+            result_s2,
+            result_s3,
+        ],
+        "total_predicted_matches": (
+            result_s2[
+                "predicted_matches"
+            ]
+            +
+            result_s3[
+                "predicted_matches"
+            ]
+        ),
+        "total_runtime_seconds": runtime,
+    }
+
+    with open(
+        REPORT_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            report,
+            f,
+            indent=2,
+        )
+
+    # --------------------------------------------------------
+    # Final
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("STAGE 08 COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"S2 predicted matches: "
+        f"{result_s2['predicted_matches']:,}"
+    )
+
+    print(
+        f"S3 predicted matches: "
+        f"{result_s3['predicted_matches']:,}"
+    )
+
+    print(
+        f"Total predicted matches: "
+        f"{report['total_predicted_matches']:,}"
+    )
+
+    print(
+        f"Runtime: "
+        f"{runtime:.2f} sec "
+        f"({runtime / 60:.2f} min)"
+    )
+
+    print(
+        f"Report: "
+        f"{REPORT_PATH}"
+    )
+
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
