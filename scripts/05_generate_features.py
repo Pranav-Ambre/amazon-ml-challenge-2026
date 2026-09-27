@@ -1,780 +1,633 @@
-"""
-STAGE 05 — TRAINING FEATURE GENERATION
+#!/usr/bin/env python3
 
-Purpose
--------
-Create a manageable supervised training dataset from the very large
-candidate sets.
+"""
+Stage 05 - Training Feature Generation
+
+Deadline-oriented feature generation for Amazon ML Challenge 2026.
 
 Strategy
 --------
-1. Load candidate pairs from S1->S2 and S1->S3.
-2. Load ground truth.
-3. Keep ALL true positive candidate pairs.
-4. Sample approximately 1 negative for every positive.
-5. Join normalized Source 1 / Source 2 / Source 3 attributes.
-6. Generate cheap, high-value matching features.
-7. Write partitioned Parquet output.
+1. Load ground truth using the project's official loader.
+2. Convert comma-separated matched_entity_ids into pair-level GT.
+3. Load generated candidate pairs.
+4. Keep every candidate that is a true positive.
+5. Sample negatives from the remaining candidates.
+6. Join normalized source attributes.
+7. Generate lightweight pairwise features.
+8. Write train_features_s2.parquet and train_features_s3.parquet.
 
-IMPORTANT
+Important
 ---------
-Do NOT calculate expensive fuzzy metrics over all 444M candidates.
-This stage is deliberately deadline-oriented.
-
-Output
-------
-artifacts/features/train_features_s2.parquet
-artifacts/features/train_features_s3.parquet
+We intentionally do NOT materialize all 444M candidate pairs into pandas.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import sys
+import random
 import time
 from pathlib import Path
 
 import polars as pl
 
-
-# ============================================================
-# PATH SETUP
-# ============================================================
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-CODE_DIR = ROOT_DIR / "code"
-
-if str(CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(CODE_DIR))
+from business_entity_resolution.src.config import ARTIFACTS_DIR
+from business_entity_resolution.src.data_loader import load_train_ground_truth
 
 
-# ============================================================
-# DIRECTORIES
-# ============================================================
+# =============================================================================
+# CONFIG
+# =============================================================================
 
-ARTIFACTS_DIR = ROOT_DIR / "artifacts"
+SEED = 42
+
+# Negative / positive ratio.
+# 1.0 means approximately one negative per positive.
+NEGATIVE_TO_POSITIVE_RATIO = 1.0
+
+# Prevent accidental explosion if the positive count is unexpectedly huge.
+MAX_NEGATIVES = 8_000_000
+
+RNG = random.Random(SEED)
 
 NORMALIZED_DIR = ARTIFACTS_DIR / "normalized"
 CANDIDATES_DIR = ARTIFACTS_DIR / "candidates"
-FEATURES_DIR = ARTIFACTS_DIR / "features"
+FEATURE_DIR = ARTIFACTS_DIR / "features"
+REPORT_DIR = ARTIFACTS_DIR / "reports"
+
+FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-FEATURES_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+TRAIN_S1 = NORMALIZED_DIR / "train_source1_normalized.parquet"
+TRAIN_S2 = NORMALIZED_DIR / "train_source2_normalized.parquet"
+TRAIN_S3 = NORMALIZED_DIR / "train_source3_normalized.parquet"
+
+CAND_S2 = CANDIDATES_DIR / "train_s1_to_s2_candidates.parquet"
+CAND_S3 = CANDIDATES_DIR / "train_s1_to_s3_candidates.parquet"
+
+OUT_S2 = FEATURE_DIR / "train_features_s2.parquet"
+OUT_S3 = FEATURE_DIR / "train_features_s3.parquet"
+
+REPORT_PATH = REPORT_DIR / "feature_generation_report.json"
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-# 1 negative for approximately every positive.
-NEGATIVE_TO_POSITIVE_RATIO = 1.0
-
-# Deterministic hash sampling.
-#
-# Smaller values produce more negatives.
-#
-# We will use hash % 20 == 0 as the initial negative sample.
-#
-# This is deliberately conservative because the candidate set
-# contains hundreds of millions of rows.
-NEGATIVE_HASH_MOD = 20
-
-RANDOM_SEED = 42
-
-
-# ============================================================
+# =============================================================================
 # LOGGING
-# ============================================================
+# =============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
 LOGGER = logging.getLogger("stage05")
 
 
-def configure_logging() -> None:
+# =============================================================================
+# HELPERS
+# =============================================================================
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
-    )
+def check_paths() -> None:
 
-
-# ============================================================
-# FILE VALIDATION
-# ============================================================
-
-def require_file(path: Path) -> None:
-
-    if not path.exists():
-
-        raise FileNotFoundError(
-            f"Required file not found:\n{path}"
-        )
-
-    if not path.is_file():
-
-        raise ValueError(
-            f"Expected file but found:\n{path}"
-        )
-
-
-# ============================================================
-# LOAD GROUND TRUTH
-# ============================================================
-
-def load_ground_truth() -> pl.LazyFrame:
-    """
-    Load the challenge ground truth.
-
-    The actual filename used by the project is detected from
-    the train data directory.
-    """
-
-    possible_paths = [
-        ROOT_DIR / "data" / "train_ground_truth.tsv",
-        ROOT_DIR / "data" / "train_ground_truth.csv",
-        ROOT_DIR / "data" / "train_ground_truth.parquet",
-        ROOT_DIR / "artifacts" / "train_ground_truth.parquet",
+    paths = [
+        TRAIN_S1,
+        TRAIN_S2,
+        TRAIN_S3,
+        CAND_S2,
+        CAND_S3,
     ]
 
-    gt_path = None
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Required file not found: {path}")
 
-    for path in possible_paths:
 
-        if path.exists():
+def load_ground_truth_pairs() -> tuple[pl.DataFrame, int]:
 
-            gt_path = path
-            break
+    LOGGER.info("Loading training ground truth...")
 
-    if gt_path is None:
+    ground_truth = load_train_ground_truth()
 
-        raise FileNotFoundError(
-            "Could not locate training ground truth.\n"
-            "Expected one of:\n"
-            + "\n".join(
-                str(p)
-                for p in possible_paths
-            )
-        )
+    gt = pl.from_pandas(ground_truth)
 
     LOGGER.info(
-        "Ground truth: %s",
-        gt_path,
+        "Ground truth rows: %,d",
+        gt.height,
     )
 
-    suffix = gt_path.suffix.lower()
+    gt = gt.select(
+        [
+            pl.col("source1_entity_id")
+            .cast(pl.Utf8),
 
-    if suffix == ".parquet":
-
-        return pl.scan_parquet(gt_path)
-
-    if suffix == ".tsv":
-
-        return pl.scan_csv(
-            gt_path,
-            separator="\t",
-        )
-
-    if suffix == ".csv":
-
-        return pl.scan_csv(
-            gt_path,
-        )
-
-    raise ValueError(
-        f"Unsupported ground truth format: {suffix}"
+            pl.col("matched_entity_ids")
+            .cast(pl.Utf8),
+        ]
     )
 
-
-# ============================================================
-# NORMALIZE GROUND TRUTH
-# ============================================================
-
-def prepare_ground_truth(
-    gt: pl.LazyFrame,
-) -> pl.LazyFrame:
-    """
-    Convert:
-
-        source1_entity_id
-        matched_entity_ids
-
-    into one row per true pair.
-    """
-
-    columns = gt.collect_schema().names()
-
-    LOGGER.info(
-        "Ground truth columns: %s",
-        columns,
-    )
-
-    if (
-        "source1_entity_id" not in columns
-        or "matched_entity_ids" not in columns
-    ):
-
-        raise ValueError(
-            "Ground truth must contain:\n"
-            "  source1_entity_id\n"
-            "  matched_entity_ids"
-        )
-
-    return (
+    zero_match_count = (
         gt
-        .select(
-            [
-                pl.col(
-                    "source1_entity_id"
-                ).cast(pl.String),
-
-                pl.col(
-                    "matched_entity_ids"
-                ),
-            ]
-        )
-        .with_columns(
-            pl.col(
-                "matched_entity_ids"
-            )
-            .cast(pl.String)
-            .str.split(",")
-            .alias(
-                "_matched_list"
-            )
-        )
-        .explode(
-            "_matched_list"
-        )
-        .with_columns(
-            pl.col(
-                "_matched_list"
-            )
-            .str.strip_chars()
-            .alias(
-                "candidate_entity_id"
-            )
-        )
         .filter(
-            pl.col(
-                "candidate_entity_id"
-            ).is_not_null()
+            pl.col("matched_entity_ids").is_null()
+            |
+            (
+                pl.col("matched_entity_ids")
+                .str.strip_chars()
+                == ""
+            )
+        )
+        .height
+    )
+
+    pairs = (
+        gt
+        .filter(
+            pl.col("matched_entity_ids").is_not_null()
             &
             (
-                pl.col(
-                    "candidate_entity_id"
-                ) != ""
+                pl.col("matched_entity_ids")
+                .str.strip_chars()
+                != ""
             )
+        )
+        .with_columns(
+            pl.col("matched_entity_ids")
+            .str.split(",")
+            .alias("matched_entity_id_list")
+        )
+        .explode("matched_entity_id_list")
+        .with_columns(
+            pl.col("matched_entity_id_list")
+            .str.strip_chars()
+            .cast(pl.Utf8)
+            .alias("candidate_entity_id")
         )
         .select(
             [
                 "source1_entity_id",
                 "candidate_entity_id",
             ]
+        )
+        .filter(
+            pl.col("candidate_entity_id").is_not_null()
+            &
+            (
+                pl.col("candidate_entity_id") != ""
+            )
         )
         .unique()
     )
 
-
-# ============================================================
-# LOAD NORMALIZED ATTRIBUTES
-# ============================================================
-
-def load_source1(
-    path: Path,
-) -> pl.LazyFrame:
-
-    return (
-        pl.scan_parquet(path)
-        .select(
-            [
-                pl.col("entity_id")
-                .alias("source1_entity_id"),
-
-                pl.col(
-                    "business_name_norm"
-                ).alias(
-                    "s1_name"
-                ),
-
-                pl.col(
-                    "business_name_compact"
-                ).alias(
-                    "s1_name_compact"
-                ),
-
-                pl.col(
-                    "business_name_sorted_tokens"
-                ).alias(
-                    "s1_name_sorted"
-                ),
-
-                pl.col(
-                    "business_address_norm"
-                ).alias(
-                    "s1_address"
-                ),
-
-                pl.col(
-                    "business_address_compact"
-                ).alias(
-                    "s1_address_compact"
-                ),
-
-                pl.col(
-                    "business_address_house_number"
-                ).alias(
-                    "s1_house_number"
-                ),
-
-                pl.col(
-                    "business_address_postal_tokens"
-                ).alias(
-                    "s1_postal"
-                ),
-
-                pl.col(
-                    "country_norm"
-                ).alias(
-                    "s1_country"
-                ),
-            ]
-        )
+    LOGGER.info(
+        "True matched pairs: %,d",
+        pairs.height,
     )
 
-
-def load_source2(
-    path: Path,
-) -> pl.LazyFrame:
-
-    return (
-        pl.scan_parquet(path)
-        .select(
-            [
-                pl.col("entity_id")
-                .alias("candidate_entity_id"),
-
-                pl.col(
-                    "business_name_norm"
-                ).alias(
-                    "candidate_name"
-                ),
-
-                pl.col(
-                    "business_name_compact"
-                ).alias(
-                    "candidate_name_compact"
-                ),
-
-                pl.col(
-                    "business_name_sorted_tokens"
-                ).alias(
-                    "candidate_name_sorted"
-                ),
-
-                pl.col(
-                    "business_address_norm"
-                ).alias(
-                    "candidate_address"
-                ),
-
-                pl.col(
-                    "business_address_compact"
-                ).alias(
-                    "candidate_address_compact"
-                ),
-
-                pl.col(
-                    "business_address_house_number"
-                ).alias(
-                    "candidate_house_number"
-                ),
-
-                pl.col(
-                    "business_address_postal_tokens"
-                ).alias(
-                    "candidate_postal"
-                ),
-
-                pl.col(
-                    "country_norm"
-                ).alias(
-                    "candidate_country"
-                ),
-            ]
-        )
+    LOGGER.info(
+        "Zero-match Source-1 entities: %,d",
+        zero_match_count,
     )
 
+    return pairs, zero_match_count
 
-# ============================================================
-# FEATURE CREATION
-# ============================================================
 
-def create_features(
+# =============================================================================
+# FEATURE ENGINEERING
+# =============================================================================
+
+def add_features(
     pairs: pl.LazyFrame,
-    source1: pl.LazyFrame,
-    source2: pl.LazyFrame,
-) -> pl.LazyFrame:
-    """
-    Join source attributes and calculate cheap vectorized features.
-    """
-
-    result = (
-        pairs
-
-        # ----------------------------------------------------
-        # Source 1
-        # ----------------------------------------------------
-
-        .join(
-            source1,
-            on="source1_entity_id",
-            how="left",
-        )
-
-        # ----------------------------------------------------
-        # Candidate source
-        # ----------------------------------------------------
-
-        .join(
-            source2,
-            on="candidate_entity_id",
-            how="left",
-        )
-
-        # ----------------------------------------------------
-        # Exact-match features
-        # ----------------------------------------------------
-
-        .with_columns(
-            [
-
-                (
-                    pl.col("s1_name_compact")
-                    ==
-                    pl.col("candidate_name_compact")
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "name_exact"
-                ),
-
-                (
-                    pl.col("s1_address_compact")
-                    ==
-                    pl.col("candidate_address_compact")
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "address_exact"
-                ),
-
-                (
-                    pl.col("s1_name_sorted")
-                    ==
-                    pl.col("candidate_name_sorted")
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "name_sorted_exact"
-                ),
-
-                (
-                    pl.col("s1_country")
-                    ==
-                    pl.col("candidate_country")
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "country_exact"
-                ),
-
-                (
-                    pl.col("s1_house_number")
-                    ==
-                    pl.col("candidate_house_number")
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "house_number_exact"
-                ),
-
-                (
-                    pl.col("s1_postal")
-                    ==
-                    pl.col("candidate_postal")
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "postal_exact"
-                ),
-            ]
-        )
-
-        # ----------------------------------------------------
-        # String length features
-        # ----------------------------------------------------
-
-        .with_columns(
-            [
-
-                pl.col(
-                    "s1_name_compact"
-                )
-                .fill_null("")
-                .str.len_chars()
-                .cast(pl.UInt16)
-                .alias(
-                    "s1_name_len"
-                ),
-
-                pl.col(
-                    "candidate_name_compact"
-                )
-                .fill_null("")
-                .str.len_chars()
-                .cast(pl.UInt16)
-                .alias(
-                    "candidate_name_len"
-                ),
-
-                pl.col(
-                    "s1_address_compact"
-                )
-                .fill_null("")
-                .str.len_chars()
-                .cast(pl.UInt16)
-                .alias(
-                    "s1_address_len"
-                ),
-
-                pl.col(
-                    "candidate_address_compact"
-                )
-                .fill_null("")
-                .str.len_chars()
-                .cast(pl.UInt16)
-                .alias(
-                    "candidate_address_len"
-                ),
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Length difference
-        # ----------------------------------------------------
-
-        .with_columns(
-            [
-
-                (
-                    pl.col("s1_name_len")
-                    -
-                    pl.col("candidate_name_len")
-                )
-                .abs()
-                .cast(pl.UInt16)
-                .alias(
-                    "name_length_diff"
-                ),
-
-                (
-                    pl.col("s1_address_len")
-                    -
-                    pl.col("candidate_address_len")
-                )
-                .abs()
-                .cast(pl.UInt16)
-                .alias(
-                    "address_length_diff"
-                ),
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Prefix equality
-        # ----------------------------------------------------
-
-        .with_columns(
-            [
-
-                (
-                    pl.col(
-                        "s1_name_compact"
-                    )
-                    .fill_null("")
-                    .str.slice(0, 4)
-                    ==
-                    pl.col(
-                        "candidate_name_compact"
-                    )
-                    .fill_null("")
-                    .str.slice(0, 4)
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "name_prefix4_exact"
-                ),
-
-                (
-                    pl.col(
-                        "s1_name_compact"
-                    )
-                    .fill_null("")
-                    .str.slice(0, 6)
-                    ==
-                    pl.col(
-                        "candidate_name_compact"
-                    )
-                    .fill_null("")
-                    .str.slice(0, 6)
-                )
-                .cast(pl.UInt8)
-                .alias(
-                    "name_prefix6_exact"
-                ),
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Keep only model-ready features
-        # ----------------------------------------------------
-
-        .select(
-            [
-                "source1_entity_id",
-                "candidate_entity_id",
-
-                "candidate_source",
-
-                "block_support_count",
-
-                "blocks",
-
-                "label",
-
-                "name_exact",
-                "address_exact",
-                "name_sorted_exact",
-                "country_exact",
-                "house_number_exact",
-                "postal_exact",
-
-                "name_prefix4_exact",
-                "name_prefix6_exact",
-
-                "s1_name_len",
-                "candidate_name_len",
-
-                "s1_address_len",
-                "candidate_address_len",
-
-                "name_length_diff",
-                "address_length_diff",
-            ]
-        )
-    )
-
-    return result
-
-
-# ============================================================
-# BUILD TRAINING PAIRS
-# ============================================================
-
-def build_training_pairs(
+    s1_path: Path,
     candidate_path: Path,
-    source1_path: Path,
-    source2_path: Path,
-    gt: pl.LazyFrame,
-    candidate_source: str,
-    output_path: Path,
-) -> dict:
+    source_name: str,
+) -> pl.LazyFrame:
 
     LOGGER.info(
-        "=" * 70
+        "Preparing features for %s",
+        source_name,
     )
 
-    LOGGER.info(
-        "Processing candidate source: %s",
-        candidate_source,
-    )
-
-    LOGGER.info(
-        "Candidate file: %s",
-        candidate_path,
-    )
-
-    # --------------------------------------------------------
-    # Candidate scan
-    # --------------------------------------------------------
-
-    candidates = (
-        pl.scan_parquet(
-            candidate_path
+    s1 = (
+        pl.scan_parquet(s1_path)
+        .select(
+            [
+                "entity_id",
+                "business_name_norm",
+                "business_name_compact",
+                "business_name_alnum",
+                "business_name_tokens",
+                "business_name_sorted_tokens",
+                "business_name_numeric_tokens",
+                "business_address_norm",
+                "business_address_compact",
+                "business_address_alnum",
+                "business_address_tokens",
+                "business_address_sorted_tokens",
+                "business_address_alpha_tokens",
+                "business_address_numeric_tokens",
+                "business_address_house_number",
+                "business_address_postal_tokens",
+                "country_norm",
+            ]
         )
+        .rename(
+            {
+                "entity_id": "source1_entity_id",
+
+                "business_name_norm": "s1_name_norm",
+                "business_name_compact": "s1_name_compact",
+                "business_name_alnum": "s1_name_alnum",
+                "business_name_tokens": "s1_name_tokens",
+                "business_name_sorted_tokens": "s1_name_sorted_tokens",
+                "business_name_numeric_tokens": "s1_name_numeric_tokens",
+
+                "business_address_norm": "s1_address_norm",
+                "business_address_compact": "s1_address_compact",
+                "business_address_alnum": "s1_address_alnum",
+                "business_address_tokens": "s1_address_tokens",
+                "business_address_sorted_tokens": "s1_address_sorted_tokens",
+                "business_address_alpha_tokens": "s1_address_alpha_tokens",
+                "business_address_numeric_tokens": "s1_address_numeric_tokens",
+                "business_address_house_number": "s1_house_number",
+                "business_address_postal_tokens": "s1_postal_tokens",
+
+                "country_norm": "s1_country_norm",
+            }
+        )
+    )
+
+    candidate = (
+        pl.scan_parquet(candidate_path)
         .select(
             [
                 "source1_entity_id",
                 "candidate_entity_id",
-                "candidate_source",
                 "block_support_count",
-                "blocks",
             ]
         )
     )
 
-    # --------------------------------------------------------
-    # TRUE POSITIVES
-    # --------------------------------------------------------
+    source = (
+        pl.scan_parquet(
+            TRAIN_S2 if source_name == "s2" else TRAIN_S3
+        )
+        .select(
+            [
+                "entity_id",
+                "business_name_norm",
+                "business_name_compact",
+                "business_name_alnum",
+                "business_name_tokens",
+                "business_name_sorted_tokens",
+                "business_name_numeric_tokens",
+                "business_address_norm",
+                "business_address_compact",
+                "business_address_alnum",
+                "business_address_tokens",
+                "business_address_sorted_tokens",
+                "business_address_alpha_tokens",
+                "business_address_numeric_tokens",
+                "business_address_house_number",
+                "business_address_postal_tokens",
+                "country_norm",
+            ]
+        )
+        .rename(
+            {
+                "entity_id": "candidate_entity_id",
 
-    positives = (
-        candidates
+                "business_name_norm": "s2_name_norm",
+                "business_name_compact": "s2_name_compact",
+                "business_name_alnum": "s2_name_alnum",
+                "business_name_tokens": "s2_name_tokens",
+                "business_name_sorted_tokens": "s2_name_sorted_tokens",
+                "business_name_numeric_tokens": "s2_name_numeric_tokens",
+
+                "business_address_norm": "s2_address_norm",
+                "business_address_compact": "s2_address_compact",
+                "business_address_alnum": "s2_address_alnum",
+                "business_address_tokens": "s2_address_tokens",
+                "business_address_sorted_tokens": "s2_address_sorted_tokens",
+                "business_address_alpha_tokens": "s2_address_alpha_tokens",
+                "business_address_numeric_tokens": "s2_address_numeric_tokens",
+                "business_address_house_number": "s2_house_number",
+                "business_address_postal_tokens": "s2_postal_tokens",
+
+                "country_norm": "s2_country_norm",
+            }
+        )
+    )
+
+    joined = (
+        pairs
         .join(
-            gt,
+            candidate,
             on=[
                 "source1_entity_id",
                 "candidate_entity_id",
             ],
             how="inner",
         )
-        .with_columns(
-            pl.lit(1)
-            .cast(pl.UInt8)
-            .alias("label")
+        .join(
+            s1,
+            on="source1_entity_id",
+            how="left",
+        )
+        .join(
+            source,
+            on="candidate_entity_id",
+            how="left",
         )
     )
 
-    positive_count = (
-        positives
-        .select(pl.len())
-        .collect()
-        .item()
+    # -------------------------------------------------------------------------
+    # Lightweight deterministic features
+    # -------------------------------------------------------------------------
+
+    joined = joined.with_columns(
+
+        # Exact normalized name.
+        (
+            pl.col("s1_name_norm")
+            == pl.col("s2_name_norm")
+        )
+        .cast(pl.Int8)
+        .alias("name_exact"),
+
+        # Exact compact name.
+        (
+            pl.col("s1_name_compact")
+            == pl.col("s2_name_compact")
+        )
+        .cast(pl.Int8)
+        .alias("name_compact_exact"),
+
+        # Exact alphanumeric name.
+        (
+            pl.col("s1_name_alnum")
+            == pl.col("s2_name_alnum")
+        )
+        .cast(pl.Int8)
+        .alias("name_alnum_exact"),
+
+        # Sorted-token name equality.
+        (
+            pl.col("s1_name_sorted_tokens")
+            == pl.col("s2_name_sorted_tokens")
+        )
+        .cast(pl.Int8)
+        .alias("name_sorted_exact"),
+
+        # Exact address.
+        (
+            pl.col("s1_address_norm")
+            == pl.col("s2_address_norm")
+        )
+        .cast(pl.Int8)
+        .alias("address_exact"),
+
+        # Compact address.
+        (
+            pl.col("s1_address_compact")
+            == pl.col("s2_address_compact")
+        )
+        .cast(pl.Int8)
+        .alias("address_compact_exact"),
+
+        # Alphanumeric address.
+        (
+            pl.col("s1_address_alnum")
+            == pl.col("s2_address_alnum")
+        )
+        .cast(pl.Int8)
+        .alias("address_alnum_exact"),
+
+        # Sorted address tokens.
+        (
+            pl.col("s1_address_sorted_tokens")
+            == pl.col("s2_address_sorted_tokens")
+        )
+        .cast(pl.Int8)
+        .alias("address_sorted_exact"),
+
+        # Country.
+        (
+            pl.col("s1_country_norm")
+            == pl.col("s2_country_norm")
+        )
+        .cast(pl.Int8)
+        .alias("country_exact"),
+
+        # House number.
+        (
+            pl.col("s1_house_number")
+            == pl.col("s2_house_number")
+        )
+        .cast(pl.Int8)
+        .alias("house_number_exact"),
+
+        # Postal token overlap.
+        (
+            pl.col("s1_postal_tokens")
+            .list.set_intersection(
+                pl.col("s2_postal_tokens")
+            )
+            .list.len()
+        )
+        .cast(pl.Int16)
+        .alias("postal_overlap"),
+
+        # Numeric address overlap.
+        (
+            pl.col("s1_address_numeric_tokens")
+            .list.set_intersection(
+                pl.col("s2_address_numeric_tokens")
+            )
+            .list.len()
+        )
+        .cast(pl.Int16)
+        .alias("address_numeric_overlap"),
+
+        # Name token overlap.
+        (
+            pl.col("s1_name_tokens")
+            .list.set_intersection(
+                pl.col("s2_name_tokens")
+            )
+            .list.len()
+        )
+        .cast(pl.Int16)
+        .alias("name_token_overlap"),
+
+        # Address token overlap.
+        (
+            pl.col("s1_address_tokens")
+            .list.set_intersection(
+                pl.col("s2_address_tokens")
+            )
+            .list.len()
+        )
+        .cast(pl.Int16)
+        .alias("address_token_overlap"),
+
+        # Block support.
+        pl.col("block_support_count")
+        .cast(pl.Int16)
+        .alias("block_support_count_feature"),
+    )
+
+    # -------------------------------------------------------------------------
+    # Length features
+    # -------------------------------------------------------------------------
+
+    joined = joined.with_columns(
+
+        pl.col("s1_name_norm")
+        .str.len_chars()
+        .fill_null(0)
+        .cast(pl.Int16)
+        .alias("s1_name_len"),
+
+        pl.col("s2_name_norm")
+        .str.len_chars()
+        .fill_null(0)
+        .cast(pl.Int16)
+        .alias("s2_name_len"),
+
+        pl.col("s1_address_norm")
+        .str.len_chars()
+        .fill_null(0)
+        .cast(pl.Int16)
+        .alias("s1_address_len"),
+
+        pl.col("s2_address_norm")
+        .str.len_chars()
+        .fill_null(0)
+        .cast(pl.Int16)
+        .alias("s2_address_len"),
+    )
+
+    joined = joined.with_columns(
+
+        (
+            pl.col("s1_name_len")
+            - pl.col("s2_name_len")
+        )
+        .abs()
+        .cast(pl.Int16)
+        .alias("name_length_diff"),
+
+        (
+            pl.col("s1_address_len")
+            - pl.col("s2_address_len")
+        )
+        .abs()
+        .cast(pl.Int16)
+        .alias("address_length_diff"),
+    )
+
+    return joined
+
+
+# =============================================================================
+# BUILD POSITIVES
+# =============================================================================
+
+def retrieve_positive_pairs(
+    gt_pairs: pl.DataFrame,
+    candidate_path: Path,
+) -> pl.DataFrame:
+
+    LOGGER.info(
+        "Retrieving positives from %s",
+        candidate_path.name,
+    )
+
+    candidates = pl.scan_parquet(
+        candidate_path
+    ).select(
+        [
+            "source1_entity_id",
+            "candidate_entity_id",
+            "block_support_count",
+        ]
+    )
+
+    positives = (
+        gt_pairs.lazy()
+        .join(
+            candidates,
+            on=[
+                "source1_entity_id",
+                "candidate_entity_id",
+            ],
+            how="inner",
+        )
+        .unique(
+            [
+                "source1_entity_id",
+                "candidate_entity_id",
+            ]
+        )
+        .collect(
+            engine="streaming"
+        )
     )
 
     LOGGER.info(
-        "Positive candidate pairs: %s",
-        f"{positive_count:,}",
+        "Retrieved positive candidates: %,d",
+        positives.height,
     )
 
-    # --------------------------------------------------------
-    # NEGATIVES
-    #
-    # Sample candidates that are NOT in GT.
-    #
-    # Deterministic hashing means repeated runs produce
-    # reproducible samples.
-    # --------------------------------------------------------
+    return positives
 
-    negative_candidates = (
-        candidates
+
+# =============================================================================
+# SAMPLE NEGATIVES
+# =============================================================================
+
+def sample_negatives(
+    gt_pairs: pl.DataFrame,
+    candidate_path: Path,
+    positive_count: int,
+) -> pl.DataFrame:
+
+    target = min(
+        int(positive_count * NEGATIVE_TO_POSITIVE_RATIO),
+        MAX_NEGATIVES,
+    )
+
+    LOGGER.info(
+        "Sampling up to %,d negatives from %s",
+        target,
+        candidate_path.name,
+    )
+
+    # Hash-based deterministic sampling.
+    #
+    # We avoid collecting all negatives. Instead we assign a deterministic
+    # hash score and take the lowest-scoring rows after removing GT pairs.
+
+    gt_lazy = gt_pairs.lazy()
+
+    candidates = (
+        pl.scan_parquet(candidate_path)
+        .select(
+            [
+                "source1_entity_id",
+                "candidate_entity_id",
+                "block_support_count",
+            ]
+        )
+        .unique(
+            [
+                "source1_entity_id",
+                "candidate_entity_id",
+            ]
+        )
         .join(
-            gt,
+            gt_lazy,
             on=[
                 "source1_entity_id",
                 "candidate_entity_id",
@@ -782,312 +635,372 @@ def build_training_pairs(
             how="anti",
         )
         .with_columns(
-            pl.struct(
+            pl.concat_str(
                 [
-                    "source1_entity_id",
-                    "candidate_entity_id",
-                ]
+                    pl.col("source1_entity_id"),
+                    pl.col("candidate_entity_id"),
+                ],
+                separator="|",
             )
-            .hash(seed=RANDOM_SEED)
-            .alias("_hash")
-        )
-        .filter(
-            (
-                pl.col("_hash")
-                % NEGATIVE_HASH_MOD
-            )
-            == 0
-        )
-        .drop("_hash")
-        .with_columns(
-            pl.lit(0)
-            .cast(pl.UInt8)
-            .alias("label")
-        )
-    )
-
-    # --------------------------------------------------------
-    # Limit negatives to desired ratio.
-    #
-    # Sort by deterministic hash first, then head.
-    # --------------------------------------------------------
-
-    desired_negative_count = int(
-        positive_count
-        * NEGATIVE_TO_POSITIVE_RATIO
-    )
-
-    negatives = (
-        negative_candidates
-        .with_columns(
-            pl.struct(
-                [
-                    "source1_entity_id",
-                    "candidate_entity_id",
-                ]
-            )
-            .hash(seed=RANDOM_SEED + 1)
+            .hash(seed=SEED)
             .alias("_sample_hash")
         )
         .sort("_sample_hash")
-        .head(desired_negative_count)
+        .head(target)
         .drop("_sample_hash")
     )
 
-    negative_count = (
-        negatives
-        .select(pl.len())
-        .collect()
-        .item()
+    negatives = candidates.collect(
+        engine="streaming"
     )
 
     LOGGER.info(
-        "Negative training pairs: %s",
-        f"{negative_count:,}",
+        "Selected negatives: %,d",
+        negatives.height,
     )
 
-    # --------------------------------------------------------
-    # Combine
-    # --------------------------------------------------------
-
-    training_pairs = pl.concat(
-        [
-            positives,
-            negatives,
-        ],
-        how="vertical_relaxed",
-    )
-
-    total_pairs = (
-        training_pairs
-        .select(pl.len())
-        .collect()
-        .item()
-    )
-
-    LOGGER.info(
-        "Total training pairs: %s",
-        f"{total_pairs:,}",
-    )
-
-    # --------------------------------------------------------
-    # Create features
-    # --------------------------------------------------------
-
-    source1 = load_source1(
-        source1_path
-    )
-
-    source2 = load_source2(
-        source2_path
-    )
-
-    features = create_features(
-        training_pairs,
-        source1,
-        source2,
-    )
-
-    # --------------------------------------------------------
-    # Collect + write
-    # --------------------------------------------------------
-
-    LOGGER.info(
-        "Collecting feature dataset..."
-    )
-
-    feature_df = features.collect()
-
-    LOGGER.info(
-        "Feature rows: %s",
-        f"{feature_df.height:,}",
-    )
-
-    LOGGER.info(
-        "Feature columns: %s",
-        feature_df.width,
-    )
-
-    feature_df.write_parquet(
-        output_path,
-        compression="zstd",
-    )
-
-    LOGGER.info(
-        "Written: %s",
-        output_path,
-    )
-
-    return {
-        "candidate_source": candidate_source,
-        "positive_pairs": int(
-            positive_count
-        ),
-        "negative_pairs": int(
-            negative_count
-        ),
-        "total_pairs": int(
-            total_pairs
-        ),
-        "feature_columns": int(
-            feature_df.width
-        ),
-        "output_path": str(
-            output_path
-        ),
-    }
+    return negatives
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# =============================================================================
+# BUILD LABELLED DATASET
+# =============================================================================
 
-def main() -> None:
-
-    configure_logging()
+def build_dataset(
+    gt_pairs: pl.DataFrame,
+    candidate_path: Path,
+    s1_path: Path,
+    source_path: Path,
+    source_name: str,
+) -> tuple[Path, dict]:
 
     start = time.time()
 
     LOGGER.info(
-        "=" * 80
+        "============================================================"
     )
 
     LOGGER.info(
-        "STAGE 05 — TRAINING FEATURE GENERATION"
+        "Building %s training features",
+        source_name,
+    )
+
+    # -------------------------------------------------------------------------
+    # Positives
+    # -------------------------------------------------------------------------
+
+    positives = retrieve_positive_pairs(
+        gt_pairs,
+        candidate_path,
+    )
+
+    positive_count = positives.height
+
+    # -------------------------------------------------------------------------
+    # Negatives
+    # -------------------------------------------------------------------------
+
+    negatives = sample_negatives(
+        gt_pairs,
+        candidate_path,
+        positive_count,
+    )
+
+    # -------------------------------------------------------------------------
+    # Labels
+    # -------------------------------------------------------------------------
+
+    positives = positives.with_columns(
+        pl.lit(1, dtype=pl.Int8).alias("label")
+    )
+
+    negatives = negatives.with_columns(
+        pl.lit(0, dtype=pl.Int8).alias("label")
+    )
+
+    pairs = (
+        pl.concat(
+            [
+                positives,
+                negatives,
+            ],
+            how="vertical",
+        )
+        .unique(
+            [
+                "source1_entity_id",
+                "candidate_entity_id",
+            ]
+        )
     )
 
     LOGGER.info(
-        "=" * 80
+        "Labelled pairs: %,d",
+        pairs.height,
     )
-
-    # --------------------------------------------------------
-    # Paths
-    # --------------------------------------------------------
-
-    train_s1 = (
-        NORMALIZED_DIR
-        / "train_source1_normalized.parquet"
-    )
-
-    train_s2 = (
-        NORMALIZED_DIR
-        / "train_source2_normalized.parquet"
-    )
-
-    train_s3 = (
-        NORMALIZED_DIR
-        / "train_source3_normalized.parquet"
-    )
-
-    candidate_s2 = (
-        CANDIDATES_DIR
-        / "train_s1_s2_candidates.parquet"
-    )
-
-    candidate_s3 = (
-        CANDIDATES_DIR
-        / "train_s1_s3_candidates.parquet"
-    )
-
-    output_s2 = (
-        FEATURES_DIR
-        / "train_features_s2.parquet"
-    )
-
-    output_s3 = (
-        FEATURES_DIR
-        / "train_features_s3.parquet"
-    )
-
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
-    for path in [
-        train_s1,
-        train_s2,
-        train_s3,
-        candidate_s2,
-        candidate_s3,
-    ]:
-
-        require_file(path)
-
-    # --------------------------------------------------------
-    # Ground truth
-    # --------------------------------------------------------
 
     LOGGER.info(
-        "Loading ground truth..."
+        "Positive: %,d | Negative: %,d",
+        positives.height,
+        negatives.height,
     )
 
-    gt = prepare_ground_truth(
-        load_ground_truth()
+    # -------------------------------------------------------------------------
+    # Generate features
+    # -------------------------------------------------------------------------
+
+    feature_lf = add_features(
+        pairs.lazy(),
+        s1_path,
+        source_path,
+        source_name,
     )
 
-    # --------------------------------------------------------
-    # S2
-    # --------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Keep model features + identifiers
+    # -------------------------------------------------------------------------
 
-    result_s2 = build_training_pairs(
-        candidate_path=candidate_s2,
-        source1_path=train_s1,
-        source2_path=train_s2,
-        gt=gt,
-        candidate_source="S2",
-        output_path=output_s2,
+    feature_lf = feature_lf.select(
+        [
+            "source1_entity_id",
+            "candidate_entity_id",
+
+            "label",
+
+            "name_exact",
+            "name_compact_exact",
+            "name_alnum_exact",
+            "name_sorted_exact",
+
+            "address_exact",
+            "address_compact_exact",
+            "address_alnum_exact",
+            "address_sorted_exact",
+
+            "country_exact",
+            "house_number_exact",
+
+            "postal_overlap",
+            "address_numeric_overlap",
+            "name_token_overlap",
+            "address_token_overlap",
+
+            "block_support_count_feature",
+
+            "s1_name_len",
+            "s2_name_len",
+            "s1_address_len",
+            "s2_address_len",
+
+            "name_length_diff",
+            "address_length_diff",
+        ]
     )
 
-    # --------------------------------------------------------
-    # S3
-    # --------------------------------------------------------
-
-    result_s3 = build_training_pairs(
-        candidate_path=candidate_s3,
-        source1_path=train_s1,
-        source2_path=train_s3,
-        gt=gt,
-        candidate_source="S3",
-        output_path=output_s3,
+    LOGGER.info(
+        "Collecting final %s feature dataset...",
+        source_name,
     )
 
-    # --------------------------------------------------------
-    # Final
-    # --------------------------------------------------------
+    features = feature_lf.collect(
+        engine="streaming"
+    )
+
+    # Fill numeric nulls.
+    numeric_cols = [
+        "name_exact",
+        "name_compact_exact",
+        "name_alnum_exact",
+        "name_sorted_exact",
+        "address_exact",
+        "address_compact_exact",
+        "address_alnum_exact",
+        "address_sorted_exact",
+        "country_exact",
+        "house_number_exact",
+        "postal_overlap",
+        "address_numeric_overlap",
+        "name_token_overlap",
+        "address_token_overlap",
+        "block_support_count_feature",
+        "s1_name_len",
+        "s2_name_len",
+        "s1_address_len",
+        "s2_address_len",
+        "name_length_diff",
+        "address_length_diff",
+    ]
+
+    features = features.with_columns(
+        [
+            pl.col(c)
+            .fill_null(0)
+            .cast(pl.Int32)
+            for c in numeric_cols
+        ]
+    )
+
+    # Shuffle deterministically.
+    features = (
+        features
+        .with_columns(
+            pl.int_range(
+                pl.len()
+            )
+            .shuffle(seed=SEED)
+            .alias("_shuffle")
+        )
+        .sort("_shuffle")
+        .drop("_shuffle")
+    )
+
+    # -------------------------------------------------------------------------
+    # Write
+    # -------------------------------------------------------------------------
+
+    output_path = (
+        OUT_S2
+        if source_name == "s2"
+        else OUT_S3
+    )
+
+    features.write_parquet(
+        output_path,
+        compression="zstd",
+        compression_level=3,
+    )
 
     elapsed = time.time() - start
 
-    LOGGER.info(
-        "=" * 80
-    )
+    report = {
+        "source": source_name,
+        "candidate_file": str(candidate_path),
+        "output_file": str(output_path),
+        "positive_pairs_retrieved": int(positive_count),
+        "negative_pairs_selected": int(negatives.height),
+        "total_training_rows": int(features.height),
+        "positive_rows": int(
+            features.filter(
+                pl.col("label") == 1
+            ).height
+        ),
+        "negative_rows": int(
+            features.filter(
+                pl.col("label") == 0
+            ).height
+        ),
+        "runtime_seconds": round(elapsed, 2),
+    }
 
     LOGGER.info(
-        "STAGE 05 COMPLETE"
-    )
-
-    LOGGER.info(
-        "Runtime: %.2f minutes",
+        "%s complete: %,d rows | %.2f min",
+        source_name,
+        features.height,
         elapsed / 60,
     )
 
+    return output_path, report
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main() -> None:
+
+    overall_start = time.time()
+
     LOGGER.info(
-        "S2 features: %s",
-        output_s2,
+        "============================================================"
+    )
+    LOGGER.info(
+        "STAGE 05 - TRAINING FEATURE GENERATION"
+    )
+    LOGGER.info(
+        "============================================================"
+    )
+
+    check_paths()
+
+    # -------------------------------------------------------------------------
+    # Ground truth
+    # -------------------------------------------------------------------------
+
+    gt_pairs, zero_match_count = (
+        load_ground_truth_pairs()
+    )
+
+    # -------------------------------------------------------------------------
+    # S2
+    # -------------------------------------------------------------------------
+
+    _, report_s2 = build_dataset(
+        gt_pairs=gt_pairs,
+        candidate_path=CAND_S2,
+        s1_path=TRAIN_S1,
+        source_path=TRAIN_S2,
+        source_name="s2",
+    )
+
+    # -------------------------------------------------------------------------
+    # S3
+    # -------------------------------------------------------------------------
+
+    _, report_s3 = build_dataset(
+        gt_pairs=gt_pairs,
+        candidate_path=CAND_S3,
+        s1_path=TRAIN_S1,
+        source_path=TRAIN_S3,
+        source_name="s3",
+    )
+
+    # -------------------------------------------------------------------------
+    # Report
+    # -------------------------------------------------------------------------
+
+    total_runtime = time.time() - overall_start
+
+    report = {
+        "stage": "05_feature_generation",
+        "status": "complete",
+        "seed": SEED,
+        "negative_to_positive_ratio": NEGATIVE_TO_POSITIVE_RATIO,
+        "max_negatives": MAX_NEGATIVES,
+        "zero_match_entities": int(zero_match_count),
+        "s2": report_s2,
+        "s3": report_s3,
+        "total_runtime_seconds": round(
+            total_runtime,
+            2,
+        ),
+    }
+
+    REPORT_PATH.write_text(
+        json.dumps(
+            report,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
     LOGGER.info(
-        "S3 features: %s",
-        output_s3,
+        "============================================================"
     )
-
     LOGGER.info(
-        "=" * 80
+        "STAGE 05 COMPLETE"
+    )
+    LOGGER.info(
+        "Total runtime: %.2f min",
+        total_runtime / 60,
+    )
+    LOGGER.info(
+        "Report: %s",
+        REPORT_PATH,
+    )
+    LOGGER.info(
+        "============================================================"
     )
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
