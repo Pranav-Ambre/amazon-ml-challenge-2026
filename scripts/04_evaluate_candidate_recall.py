@@ -1,747 +1,597 @@
 """
-Stage 04 — Candidate Recall Evaluation
+STAGE 04 — CANDIDATE RECALL EVALUATION
 
-Purpose
--------
-Measure how many true ground-truth matches are present in the
-candidate sets generated during Stage 03.
+Correctly evaluates candidate recall separately for:
+    S1 -> S2
+    S1 -> S3
 
-Evaluates:
-
-    TRAIN S1 -> S2
-    TRAIN S1 -> S3
-
-Ground truth format:
-
-    source1_entity_id
-    matched_entity_ids
-
-where matched_entity_ids may contain:
-
-    ID1
-    ID1,ID2
-    ID1,ID2,ID3
-
-Empty matched_entity_ids means zero matches.
-
-Outputs
--------
-artifacts/reports/candidate_recall_report.json
-
-artifacts/reports/candidate_recall_misses/
-    s1_s2_missed_examples.parquet
-    s1_s3_missed_examples.parquet
+Important:
+Ground truth contains matched_entity_ids from both Source 2 and Source 3.
+Therefore, we MUST first identify which matched IDs belong to S2/S3.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 import time
 from pathlib import Path
 
-import pandas as pd
 import polars as pl
 
-
-# ============================================================
-# PROJECT ROOT
-# ============================================================
-
-ROOT = Path(__file__).resolve().parents[1]
-
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-
-# ============================================================
-# PROJECT IMPORTS
-# ============================================================
-
-from code.business_entity_resolution.src.data_loader import (
+from business_entity_resolution.src.config import (
+    ARTIFACTS_DIR,
+)
+from business_entity_resolution.src.data_loader import (
     load_train_ground_truth,
 )
 
 
-# ============================================================
+# ============================================================================
 # PATHS
-# ============================================================
+# ============================================================================
 
-CANDIDATE_DIR = (
-    ROOT
-    / "artifacts"
-    / "candidates"
-)
+NORMALIZED_DIR = ARTIFACTS_DIR / "normalized"
+CANDIDATES_DIR = ARTIFACTS_DIR / "candidates"
+REPORT_DIR = ARTIFACTS_DIR / "reports"
+MISS_DIR = REPORT_DIR / "candidate_recall_misses"
 
-REPORT_DIR = (
-    ROOT
-    / "artifacts"
-    / "reports"
-)
+S2_NORMALIZED = NORMALIZED_DIR / "train_source2_normalized.parquet"
+S3_NORMALIZED = NORMALIZED_DIR / "train_source3_normalized.parquet"
 
-MISS_DIR = (
-    REPORT_DIR
-    / "candidate_recall_misses"
-)
+S2_CANDIDATES = CANDIDATES_DIR / "train_s1_s2_candidates.parquet"
+S3_CANDIDATES = CANDIDATES_DIR / "train_s1_s3_candidates.parquet"
+
+REPORT_PATH = REPORT_DIR / "candidate_recall_report.json"
 
 
-# ============================================================
-# Candidate files
-# ============================================================
+# ============================================================================
+# HELPERS
+# ============================================================================
 
-S2_CANDIDATES = (
-    CANDIDATE_DIR
-    / "train_s1_s2_candidates.parquet"
-)
-
-S3_CANDIDATES = (
-    CANDIDATE_DIR
-    / "train_s1_s3_candidates.parquet"
-)
-
-
-# ============================================================
-# Helper: validate files
-# ============================================================
-
-def validate_input_files() -> None:
-
+def print_section(title: str) -> None:
     print()
     print("=" * 80)
-    print("VALIDATING INPUT FILES")
+    print(title)
     print("=" * 80)
 
-    files = {
-        "S2 candidates": S2_CANDIDATES,
-        "S3 candidates": S3_CANDIDATES,
-    }
 
-    for name, path in files.items():
-
-        print()
-        print(f"{name}:")
-        print(f"  {path}")
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"\nRequired file does not exist:\n{path}"
-            )
-
-        size_gb = (
-            path.stat().st_size
-            / (1024 ** 3)
+def validate_file(path: Path, label: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{label} does not exist:\n{path}"
         )
 
-        print(
-            f"  Size: {size_gb:.2f} GB"
-        )
+    size_gb = path.stat().st_size / (1024 ** 3)
 
-    REPORT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    MISS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-# ============================================================
-# Ground truth preparation
-# ============================================================
-
-def prepare_ground_truth():
-    """
-    Load and explode the training ground truth.
-
-    Returns
-    -------
-    matched_gt:
-        DataFrame containing one true pair per row.
-
-    full_gt:
-        Complete ground truth including zero-match entities.
-    """
-
+    print(f"{label}:")
+    print(f"  {path}")
+    print(f"  Size: {size_gb:.2f} GB")
     print()
-    print("=" * 80)
-    print("LOADING GROUND TRUTH")
-    print("=" * 80)
 
-    gt = load_train_ground_truth()
 
-    print(
-        f"Ground truth rows: {len(gt):,}"
-    )
+def load_source_ids(path: Path, source_name: str) -> pl.LazyFrame:
+    """
+    Load only entity_id from normalized source.
 
-    # --------------------------------------------------------
-    # Validate expected columns.
-    # --------------------------------------------------------
+    Lazy execution avoids loading the entire normalized dataset.
+    """
 
-    required = {
-        "source1_entity_id",
-        "matched_entity_ids",
-    }
+    print(f"Loading {source_name} entity IDs:")
+    print(f"  {path}")
 
-    missing = (
-        required
-        - set(gt.columns)
-    )
-
-    if missing:
-        raise ValueError(
-            "Ground truth is missing columns: "
-            f"{sorted(missing)}"
+    return (
+        pl.scan_parquet(path)
+        .select(
+            pl.col("entity_id")
+            .cast(pl.Utf8)
+            .alias("matched_entity_id")
         )
+        .unique()
+    )
 
-    # --------------------------------------------------------
-    # Keep required columns only.
-    # --------------------------------------------------------
 
-    gt = gt[
+def prepare_ground_truth(ground_truth) -> pl.LazyFrame:
+    """
+    Convert ground truth into:
+
+        source1_entity_id
+        matched_entity_id
+
+    one row per true pair.
+    """
+
+    gt = pl.from_pandas(ground_truth)
+
+    print(f"Ground truth rows: {gt.height:,}")
+
+    # ------------------------------------------------------------------------
+    # Normalize column names
+    # ------------------------------------------------------------------------
+
+    gt = gt.select(
         [
-            "source1_entity_id",
-            "matched_entity_ids",
+            pl.col("source1_entity_id")
+            .cast(pl.Utf8)
+            .alias("source1_entity_id"),
+
+            pl.col("matched_entity_ids")
+            .cast(pl.Utf8)
+            .alias("matched_entity_ids"),
         ]
-    ].copy()
-
-    # --------------------------------------------------------
-    # Normalize IDs.
-    # --------------------------------------------------------
-
-    gt["source1_entity_id"] = (
-        gt["source1_entity_id"]
-        .astype("string")
-        .str.strip()
     )
 
-    gt["matched_entity_ids"] = (
-        gt["matched_entity_ids"]
-        .fillna("")
-        .astype("string")
-        .str.strip()
-    )
+    # ------------------------------------------------------------------------
+    # Zero-match entities
+    # ------------------------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Count zero-match S1 entities.
-    # --------------------------------------------------------
-
-    zero_match_mask = (
-        gt["matched_entity_ids"]
-        == ""
-    )
-
-    zero_match_count = int(
-        zero_match_mask.sum()
-    )
-
-    print(
-        f"Zero-match S1 entities: "
-        f"{zero_match_count:,}"
-    )
-
-    # --------------------------------------------------------
-    # Keep only rows with matches.
-    # --------------------------------------------------------
-
-    matched = gt[
-        ~zero_match_mask
-    ].copy()
-
-    # --------------------------------------------------------
-    # Split comma-separated target IDs.
-    # --------------------------------------------------------
-
-    matched["candidate_entity_id"] = (
-        matched["matched_entity_ids"]
-        .str.split(",")
-    )
-
-    # --------------------------------------------------------
-    # Explode to one true pair per row.
-    # --------------------------------------------------------
-
-    matched = matched.explode(
-        "candidate_entity_id",
-        ignore_index=True,
-    )
-
-    # --------------------------------------------------------
-    # Clean candidate IDs.
-    # --------------------------------------------------------
-
-    matched["candidate_entity_id"] = (
-        matched["candidate_entity_id"]
-        .astype("string")
-        .str.strip()
-    )
-
-    # Remove accidental empty IDs.
-    matched = matched[
-        matched["candidate_entity_id"]
-        != ""
-    ]
-
-    # --------------------------------------------------------
-    # Keep only pair columns.
-    # --------------------------------------------------------
-
-    matched = matched[
-        [
-            "source1_entity_id",
-            "candidate_entity_id",
-        ]
-    ]
-
-    # --------------------------------------------------------
-    # Remove duplicate ground-truth pairs.
-    # --------------------------------------------------------
-
-    matched = matched.drop_duplicates(
-        ignore_index=True
-    )
-
-    print(
-        f"True matched pairs: "
-        f"{len(matched):,}"
-    )
-
-    return matched, gt
-
-
-# ============================================================
-# Evaluate one candidate file
-# ============================================================
-
-def evaluate_candidate_file(
-    candidate_path: Path,
-    ground_truth: pd.DataFrame,
-    source_name: str,
-):
-    """
-    Compare ground-truth pairs against one candidate Parquet.
-
-    Important:
-        The candidate file is NOT loaded into pandas.
-
-        Polars scans only the two columns required:
-
-            source1_entity_id
-            candidate_entity_id
-    """
-
-    print()
-    print("=" * 80)
-    print(f"EVALUATING {source_name}")
-    print("=" * 80)
-
-    print(
-        f"Candidate file:\n"
-        f"{candidate_path}"
-    )
-
-    # --------------------------------------------------------
-    # Ground truth → Polars LazyFrame
-    # --------------------------------------------------------
-
-    gt_lazy = (
-        pl.from_pandas(
-            ground_truth
+    zero_match_count = (
+        gt.filter(
+            pl.col("matched_entity_ids").is_null()
+            | (pl.col("matched_entity_ids").str.strip_chars() == "")
         )
-        .lazy()
+        .height
     )
 
-    # --------------------------------------------------------
-    # Candidate file → LazyFrame
-    #
-    # Only two columns are read.
-    # --------------------------------------------------------
+    print(f"Zero-match S1 entities: {zero_match_count:,}")
 
-    candidates_lazy = (
-        pl.scan_parquet(
-            candidate_path,
-            low_memory=True,
+    # ------------------------------------------------------------------------
+    # Explode matched IDs
+    # ------------------------------------------------------------------------
+
+    pairs = (
+        gt
+        .filter(
+            pl.col("matched_entity_ids").is_not_null()
+            & (pl.col("matched_entity_ids").str.strip_chars() != "")
+        )
+        .with_columns(
+            pl.col("matched_entity_ids")
+            .str.split(",")
+            .alias("matched_entity_id_list")
+        )
+        .explode("matched_entity_id_list")
+        .with_columns(
+            pl.col("matched_entity_id_list")
+            .str.strip_chars()
+            .cast(pl.Utf8)
+            .alias("matched_entity_id")
         )
         .select(
             [
                 "source1_entity_id",
-                "candidate_entity_id",
+                "matched_entity_id",
+            ]
+        )
+        .filter(
+            pl.col("matched_entity_id").is_not_null()
+            & (pl.col("matched_entity_id") != "")
+        )
+        .unique()
+    )
+
+    return pairs.lazy()
+
+
+def split_ground_truth_by_source(
+    gt_pairs: pl.LazyFrame,
+    s2_ids: pl.LazyFrame,
+    s3_ids: pl.LazyFrame,
+):
+    """
+    Split ground-truth pairs according to source membership.
+
+    S2 true pairs:
+        GT matched_entity_id exists in Source 2.
+
+    S3 true pairs:
+        GT matched_entity_id exists in Source 3.
+    """
+
+    # ------------------------------------------------------------------------
+    # S1 -> S2
+    # ------------------------------------------------------------------------
+
+    gt_s2 = (
+        gt_pairs
+        .join(
+            s2_ids,
+            on="matched_entity_id",
+            how="semi",
+        )
+        .unique()
+    )
+
+    # ------------------------------------------------------------------------
+    # S1 -> S3
+    # ------------------------------------------------------------------------
+
+    gt_s3 = (
+        gt_pairs
+        .join(
+            s3_ids,
+            on="matched_entity_id",
+            how="semi",
+        )
+        .unique()
+    )
+
+    return gt_s2, gt_s3
+
+
+def evaluate_recall(
+    gt_pairs: pl.LazyFrame,
+    candidate_path: Path,
+    source_name: str,
+):
+    """
+    Evaluate candidate recall for one source.
+    """
+
+    print_section(f"EVALUATING S1 -> {source_name}")
+
+    print("Candidate file:")
+    print(candidate_path)
+    print()
+
+    # ------------------------------------------------------------------------
+    # Load candidate pairs lazily
+    # ------------------------------------------------------------------------
+
+    candidates = (
+        pl.scan_parquet(candidate_path)
+        .select(
+            [
+                pl.col("source1_entity_id")
+                .cast(pl.Utf8)
+                .alias("source1_entity_id"),
+
+                pl.col("candidate_entity_id")
+                .cast(pl.Utf8)
+                .alias("matched_entity_id"),
             ]
         )
         .unique()
     )
 
-    # --------------------------------------------------------
-    # Retrieve true pairs that exist in candidates.
-    #
-    # Everything remains LazyFrame until collect().
-    # --------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Count true pairs
+    # ------------------------------------------------------------------------
 
-    retrieved_lazy = (
-        gt_lazy
+    true_count = (
+        gt_pairs
+        .select(pl.len().alias("count"))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    # ------------------------------------------------------------------------
+    # Retrieved true pairs
+    #
+    # INNER JOIN:
+    #   GT pair exists in candidate set.
+    # ------------------------------------------------------------------------
+
+    retrieved = (
+        gt_pairs
         .join(
-            candidates_lazy,
+            candidates,
             on=[
                 "source1_entity_id",
-                "candidate_entity_id",
+                "matched_entity_id",
             ],
             how="inner",
         )
         .unique()
     )
 
-    # --------------------------------------------------------
-    # Materialize only retrieved TRUE pairs.
-    #
-    # This should be at most the number of true pairs,
-    # not the entire candidate set.
-    # --------------------------------------------------------
+    retrieved_df = retrieved.collect(engine="streaming")
 
-    retrieved_df = (
-        retrieved_lazy
-        .collect(
-            engine="streaming"
-        )
+    retrieved_count = retrieved_df.height
+
+    missed_count = true_count - retrieved_count
+
+    recall = (
+        retrieved_count / true_count
+        if true_count > 0
+        else 0.0
     )
 
-    retrieved_count = len(
-        retrieved_df
-    )
+    print(f"True pairs       : {true_count:,}")
+    print(f"Retrieved pairs  : {retrieved_count:,}")
+    print(f"Missed pairs     : {missed_count:,}")
+    print(f"Candidate recall : {recall:.4%}")
 
-    true_count = len(
-        ground_truth
-    )
+    # ------------------------------------------------------------------------
+    # Save missed examples
+    # ------------------------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Candidate recall.
-    # --------------------------------------------------------
-
-    if true_count > 0:
-        recall = (
-            retrieved_count
-            / true_count
-        )
-    else:
-        recall = 0.0
-
-    # --------------------------------------------------------
-    # Find missed ground-truth pairs.
-    #
-    # Convert retrieved DataFrame back to LazyFrame so both
-    # sides of the join are LazyFrames.
-    # --------------------------------------------------------
-
-    missed_lazy = (
-        gt_lazy
+    missed = (
+        gt_pairs
         .join(
             retrieved_df.lazy(),
             on=[
                 "source1_entity_id",
-                "candidate_entity_id",
+                "matched_entity_id",
             ],
             how="anti",
         )
+        .limit(100_000)
+        .collect(engine="streaming")
     )
 
-    missed_df = (
-        missed_lazy
-        .collect(
-            engine="streaming"
-        )
-    )
+    MISS_DIR.mkdir(parents=True, exist_ok=True)
 
-    missed_count = len(
-        missed_df
-    )
+    miss_path = MISS_DIR / f"s1_{source_name.lower()}_missed_examples.parquet"
 
-    # --------------------------------------------------------
-    # Results.
-    # --------------------------------------------------------
-
-    print()
-    print(
-        f"True pairs       : "
-        f"{true_count:,}"
-    )
-
-    print(
-        f"Retrieved pairs  : "
-        f"{retrieved_count:,}"
-    )
-
-    print(
-        f"Missed pairs     : "
-        f"{missed_count:,}"
-    )
-
-    print(
-        f"Candidate recall : "
-        f"{recall * 100:.4f}%"
-    )
-
-    return {
-        "source": source_name,
-        "true_pairs": true_count,
-        "retrieved_pairs": retrieved_count,
-        "missed_pairs": missed_count,
-        "candidate_recall": recall,
-        "missed_examples": missed_df.head(100),
-    }
-
-
-# ============================================================
-# Save missed examples
-# ============================================================
-
-def save_missed_examples(
-    result,
-    filename: str,
-) -> None:
-
-    path = (
-        MISS_DIR
-        / filename
-    )
-
-    result["missed_examples"].write_parquet(
-        path,
+    missed.write_parquet(
+        miss_path,
         compression="zstd",
     )
 
-    print(
-        f"Missed examples saved:\n"
-        f"{path}"
+    print(f"Missed examples saved:")
+    print(miss_path)
+
+    return {
+        "true_pairs": int(true_count),
+        "retrieved_pairs": int(retrieved_count),
+        "missed_pairs": int(missed_count),
+        "candidate_recall": float(recall),
+        "missed_examples_path": str(miss_path),
+    }
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+
+    start_time = time.time()
+
+    print()
+    print("#" * 80)
+    print("# STAGE 04 — CORRECTED CANDIDATE RECALL EVALUATION")
+    print("#" * 80)
+
+    # ========================================================================
+    # VALIDATE FILES
+    # ========================================================================
+
+    print_section("VALIDATING INPUT FILES")
+
+    validate_file(
+        S2_NORMALIZED,
+        "S2 normalized source",
     )
 
+    validate_file(
+        S3_NORMALIZED,
+        "S3 normalized source",
+    )
 
-# ============================================================
-# Save JSON report
-# ============================================================
+    validate_file(
+        S2_CANDIDATES,
+        "S2 candidates",
+    )
 
-def save_report(
-    s2_result,
-    s3_result,
-) -> Path:
+    validate_file(
+        S3_CANDIDATES,
+        "S3 candidates",
+    )
+
+    # ========================================================================
+    # LOAD GROUND TRUTH
+    # ========================================================================
+
+    print_section("LOADING GROUND TRUTH")
+
+    ground_truth = load_train_ground_truth()
+
+    gt_pairs = prepare_ground_truth(ground_truth)
+
+    # Materialize total pair count only.
+    total_pairs = (
+        gt_pairs
+        .select(pl.len().alias("count"))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    print(f"Total true matched pairs: {total_pairs:,}")
+
+    # ========================================================================
+    # LOAD SOURCE ID INDEXES
+    # ========================================================================
+
+    print_section("BUILDING SOURCE ID INDEXES")
+
+    s2_ids = load_source_ids(
+        S2_NORMALIZED,
+        "Source 2",
+    )
+
+    s3_ids = load_source_ids(
+        S3_NORMALIZED,
+        "Source 3",
+    )
+
+    # ========================================================================
+    # CHECK ID OVERLAP
+    # ========================================================================
+
+    print_section("CHECKING SOURCE ID OVERLAP")
+
+    overlapping_ids = (
+        s2_ids
+        .join(
+            s3_ids,
+            on="matched_entity_id",
+            how="inner",
+        )
+        .select(pl.len().alias("count"))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    print(
+        f"Entity IDs appearing in BOTH S2 and S3: "
+        f"{overlapping_ids:,}"
+    )
+
+    if overlapping_ids > 0:
+        print()
+        print(
+            "WARNING: Some entity IDs exist in both S2 and S3."
+        )
+        print(
+            "Those IDs may belong to both source namespaces."
+        )
+
+    # ========================================================================
+    # SPLIT GROUND TRUTH
+    # ========================================================================
+
+    print_section("SPLITTING GROUND TRUTH BY SOURCE")
+
+    gt_s2, gt_s3 = split_ground_truth_by_source(
+        gt_pairs,
+        s2_ids,
+        s3_ids,
+    )
+
+    s2_true_count = (
+        gt_s2
+        .select(pl.len().alias("count"))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    s3_true_count = (
+        gt_s3
+        .select(pl.len().alias("count"))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    print(f"S1 -> S2 true pairs: {s2_true_count:,}")
+    print(f"S1 -> S3 true pairs: {s3_true_count:,}")
+    print(
+        f"S2 + S3:              "
+        f"{s2_true_count + s3_true_count:,}"
+    )
+    print(
+        f"Original GT pairs:     "
+        f"{total_pairs:,}"
+    )
+
+    # ========================================================================
+    # EVALUATE
+    # ========================================================================
+
+    result_s2 = evaluate_recall(
+        gt_s2,
+        S2_CANDIDATES,
+        "S2",
+    )
+
+    result_s3 = evaluate_recall(
+        gt_s3,
+        S3_CANDIDATES,
+        "S3",
+    )
+
+    # ========================================================================
+    # FINAL REPORT
+    # ========================================================================
+
+    print_section("FINAL CANDIDATE RECALL")
+
+    print()
+    print("S1 -> S2")
+    print(f"  True pairs      : {result_s2['true_pairs']:,}")
+    print(f"  Retrieved       : {result_s2['retrieved_pairs']:,}")
+    print(f"  Missed          : {result_s2['missed_pairs']:,}")
+    print(f"  Recall          : {result_s2['candidate_recall']:.4%}")
+
+    print()
+    print("S1 -> S3")
+    print(f"  True pairs      : {result_s3['true_pairs']:,}")
+    print(f"  Retrieved       : {result_s3['retrieved_pairs']:,}")
+    print(f"  Missed          : {result_s3['missed_pairs']:,}")
+    print(f"  Recall          : {result_s3['candidate_recall']:.4%}")
+
+    # ========================================================================
+    # OVERALL
+    # ========================================================================
+
+    total_true = (
+        result_s2["true_pairs"]
+        + result_s3["true_pairs"]
+    )
+
+    total_retrieved = (
+        result_s2["retrieved_pairs"]
+        + result_s3["retrieved_pairs"]
+    )
+
+    total_missed = total_true - total_retrieved
+
+    overall_recall = (
+        total_retrieved / total_true
+        if total_true > 0
+        else 0.0
+    )
+
+    print()
+    print("OVERALL")
+    print(f"  True pairs      : {total_true:,}")
+    print(f"  Retrieved       : {total_retrieved:,}")
+    print(f"  Missed          : {total_missed:,}")
+    print(f"  Recall          : {overall_recall:.4%}")
+
+    # ========================================================================
+    # SAVE REPORT
+    # ========================================================================
 
     report = {
         "stage": "04_candidate_recall",
-
-        "s1_s2": {
-            "true_pairs": s2_result[
-                "true_pairs"
-            ],
-
-            "retrieved_pairs": s2_result[
-                "retrieved_pairs"
-            ],
-
-            "missed_pairs": s2_result[
-                "missed_pairs"
-            ],
-
-            "candidate_recall": s2_result[
-                "candidate_recall"
-            ],
-
-            "candidate_recall_percent": (
-                s2_result[
-                    "candidate_recall"
-                ]
-                * 100
-            ),
+        "status": "complete",
+        "ground_truth": {
+            "total_pairs": int(total_pairs),
+            "s2_true_pairs": int(s2_true_count),
+            "s3_true_pairs": int(s3_true_count),
         },
-
-        "s1_s3": {
-            "true_pairs": s3_result[
-                "true_pairs"
-            ],
-
-            "retrieved_pairs": s3_result[
-                "retrieved_pairs"
-            ],
-
-            "missed_pairs": s3_result[
-                "missed_pairs"
-            ],
-
-            "candidate_recall": s3_result[
-                "candidate_recall"
-            ],
-
-            "candidate_recall_percent": (
-                s3_result[
-                    "candidate_recall"
-                ]
-                * 100
-            ),
+        "source_id_overlap": {
+            "overlapping_ids": int(overlapping_ids),
         },
+        "s1_to_s2": result_s2,
+        "s1_to_s3": result_s3,
+        "overall": {
+            "true_pairs": int(total_true),
+            "retrieved_pairs": int(total_retrieved),
+            "missed_pairs": int(total_missed),
+            "candidate_recall": float(overall_recall),
+        },
+        "runtime_seconds": time.time() - start_time,
     }
 
-    path = (
-        REPORT_DIR
-        / "candidate_recall_report.json"
-    )
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(
-        path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
+    with open(REPORT_PATH, "w") as f:
         json.dump(
             report,
             f,
             indent=2,
         )
 
-    return path
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-
-    start = time.perf_counter()
-
     print()
-    print("#" * 80)
-    print("# STAGE 04 — CANDIDATE RECALL EVALUATION")
-    print("#" * 80)
-
-    # --------------------------------------------------------
-    # Validate candidate files.
-    # --------------------------------------------------------
-
-    validate_input_files()
-
-    # --------------------------------------------------------
-    # Load ground truth.
-    # --------------------------------------------------------
-
-    matched_gt, full_gt = (
-        prepare_ground_truth()
-    )
-
-    # --------------------------------------------------------
-    # Evaluate S1 -> S2.
-    # --------------------------------------------------------
-
-    s2_result = evaluate_candidate_file(
-        candidate_path=S2_CANDIDATES,
-        ground_truth=matched_gt,
-        source_name="S1 -> S2",
-    )
-
-    # --------------------------------------------------------
-    # Evaluate S1 -> S3.
-    # --------------------------------------------------------
-
-    s3_result = evaluate_candidate_file(
-        candidate_path=S3_CANDIDATES,
-        ground_truth=matched_gt,
-        source_name="S1 -> S3",
-    )
-
-    # --------------------------------------------------------
-    # Save missed examples.
-    # --------------------------------------------------------
-
-    save_missed_examples(
-        s2_result,
-        "s1_s2_missed_examples.parquet",
-    )
-
-    save_missed_examples(
-        s3_result,
-        "s1_s3_missed_examples.parquet",
-    )
-
-    # --------------------------------------------------------
-    # Save report.
-    # --------------------------------------------------------
-
-    report_path = save_report(
-        s2_result,
-        s3_result,
-    )
-
-    # --------------------------------------------------------
-    # Final summary.
-    # --------------------------------------------------------
-
-    elapsed = (
-        time.perf_counter()
-        - start
-    )
-
-    print()
-    print("#" * 80)
-    print("# FINAL CANDIDATE RECALL")
-    print("#" * 80)
-
-    print()
-    print(
-        "S1 -> S2"
-    )
-
-    print(
-        f"  True pairs      : "
-        f"{s2_result['true_pairs']:,}"
-    )
-
-    print(
-        f"  Retrieved       : "
-        f"{s2_result['retrieved_pairs']:,}"
-    )
-
-    print(
-        f"  Missed          : "
-        f"{s2_result['missed_pairs']:,}"
-    )
-
-    print(
-        f"  Recall          : "
-        f"{s2_result['candidate_recall'] * 100:.4f}%"
-    )
-
-    print()
-    print(
-        "S1 -> S3"
-    )
-
-    print(
-        f"  True pairs      : "
-        f"{s3_result['true_pairs']:,}"
-    )
-
-    print(
-        f"  Retrieved       : "
-        f"{s3_result['retrieved_pairs']:,}"
-    )
-
-    print(
-        f"  Missed          : "
-        f"{s3_result['missed_pairs']:,}"
-    )
-
-    print(
-        f"  Recall          : "
-        f"{s3_result['candidate_recall'] * 100:.4f}%"
-    )
-
-    print()
-    print(
-        f"Report:\n"
-        f"{report_path}"
-    )
+    print(f"Report:")
+    print(REPORT_PATH)
 
     print()
     print(
         f"Runtime: "
-        f"{elapsed / 60:.2f} minutes"
+        f"{(time.time() - start_time) / 60:.2f} minutes"
     )
 
     print()
@@ -749,10 +599,6 @@ def main():
     print("# STAGE 04 COMPLETE")
     print("#" * 80)
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
