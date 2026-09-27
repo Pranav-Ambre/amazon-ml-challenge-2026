@@ -34,10 +34,13 @@ from src.config import (
 )
 
 from src.data_loader import (
-    load_source1,
-    load_source2,
-    load_source3,
-    load_ground_truth,
+    load_train_source1,
+    load_train_source2,
+    load_train_source3,
+    load_train_ground_truth,
+    load_test_source1,
+    load_test_source2,
+    load_test_source3,
 )
 
 
@@ -55,10 +58,13 @@ ID_COLUMN = "entity_id"
 
 
 # ============================================================
-# TEXT COLUMN PROFILE
+# TEXT PROFILE
 # ============================================================
 
-def profile_text_column(df: pd.DataFrame, column: str) -> dict:
+def profile_text_column(
+    df: pd.DataFrame,
+    column: str
+) -> dict:
     """
     Generate statistics for a text column.
     """
@@ -80,37 +86,45 @@ def profile_text_column(df: pd.DataFrame, column: str) -> dict:
 
     return {
         "exists": True,
+
         "null_count": int(
             series.isna().sum()
         ),
+
         "empty_count": int(
             (string_series.str.strip() == "").sum()
         ),
+
         "min_length": (
             int(lengths.min())
             if len(lengths)
             else 0
         ),
+
         "max_length": (
             int(lengths.max())
             if len(lengths)
             else 0
         ),
+
         "mean_length": (
             float(lengths.mean())
             if len(lengths)
             else 0
         ),
+
         "median_length": (
             float(lengths.median())
             if len(lengths)
             else 0
         ),
+
         "p25_length": (
             float(lengths.quantile(0.25))
             if len(lengths)
             else 0
         ),
+
         "p75_length": (
             float(lengths.quantile(0.75))
             if len(lengths)
@@ -128,7 +142,7 @@ def profile_id_column(
     column: str
 ) -> dict:
     """
-    Generate statistics for entity IDs.
+    Generate statistics for an entity ID column.
     """
 
     if column not in df.columns:
@@ -140,15 +154,25 @@ def profile_id_column(
 
     return {
         "exists": True,
-        "row_count": int(len(series)),
+
+        "row_count": int(
+            len(series)
+        ),
+
         "null_count": int(
             series.isna().sum()
         ),
+
         "unique_count": int(
-            series.nunique(dropna=True)
+            series.nunique(
+                dropna=True
+            )
         ),
+
         "duplicate_count": int(
-            series.duplicated(keep=False).sum()
+            series.duplicated(
+                keep=False
+            ).sum()
         ),
     }
 
@@ -180,12 +204,13 @@ def profile_country(
 
     return {
         str(country): int(count)
-        for country, count in counts.head(50).items()
+        for country, count
+        in counts.head(50).items()
     }
 
 
 # ============================================================
-# DUPLICATE ROW PROFILE
+# DUPLICATE PROFILE
 # ============================================================
 
 def profile_duplicate_rows(
@@ -203,7 +228,7 @@ def profile_duplicate_rows(
 
 
 # ============================================================
-# SOURCE DATASET PROFILE
+# SOURCE PROFILE
 # ============================================================
 
 def profile_source(
@@ -211,17 +236,25 @@ def profile_source(
     dataset_name: str
 ) -> dict:
     """
-    Generate complete profile for Source 1/2/3.
+    Generate profile for Source 1/2/3.
     """
 
     profile = {
+
         "dataset": dataset_name,
-        "rows": int(len(df)),
-        "columns": list(df.columns),
+
+        "rows": int(
+            len(df)
+        ),
+
+        "columns": list(
+            df.columns
+        ),
 
         "dtypes": {
             column: str(dtype)
-            for column, dtype in df.dtypes.items()
+            for column, dtype
+            in df.dtypes.items()
         },
 
         "id_profile": profile_id_column(
@@ -231,10 +264,18 @@ def profile_source(
 
         "text_profile": {},
 
-        "country_distribution": profile_country(df),
+        "country_distribution": (
+            profile_country(df)
+        ),
 
-        "duplicates": profile_duplicate_rows(df),
+        "duplicates": (
+            profile_duplicate_rows(df)
+        ),
     }
+
+    # --------------------------------------------------------
+    # TEXT COLUMNS
+    # --------------------------------------------------------
 
     for column in TEXT_COLUMNS:
 
@@ -260,13 +301,19 @@ def profile_ground_truth(
     """
 
     profile = {
-        "rows": int(len(df)),
 
-        "columns": list(df.columns),
+        "rows": int(
+            len(df)
+        ),
+
+        "columns": list(
+            df.columns
+        ),
 
         "dtypes": {
             column: str(dtype)
-            for column, dtype in df.dtypes.items()
+            for column, dtype
+            in df.dtypes.items()
         },
 
         "null_counts": {
@@ -287,12 +334,16 @@ def profile_ground_truth(
 
             "unique_count": int(
                 df["source1_entity_id"]
-                .nunique(dropna=True)
+                .nunique(
+                    dropna=True
+                )
             ),
 
             "duplicate_count": int(
                 df["source1_entity_id"]
-                .duplicated(keep=False)
+                .duplicated(
+                    keep=False
+                )
                 .sum()
             ),
         }
@@ -312,7 +363,9 @@ def profile_ground_truth(
         profile["matched_entity_ids"] = {
 
             "empty_count": int(
-                (matched.str.strip() == "").sum()
+                (
+                    matched.str.strip() == ""
+                ).sum()
             ),
 
             "sample_values": (
@@ -322,7 +375,9 @@ def profile_ground_truth(
             ),
 
             "max_string_length": (
-                int(matched.str.len().max())
+                int(
+                    matched.str.len().max()
+                )
                 if len(matched)
                 else 0
             ),
@@ -332,43 +387,33 @@ def profile_ground_truth(
 
 
 # ============================================================
-# LOAD AND PROFILE SOURCE
+# LOAD + PROFILE TRAIN SOURCE
 # ============================================================
 
-def load_and_profile_source(
+def profile_train_source(
     path: Path,
     loader,
     name: str
 ) -> dict:
     """
-    Load a dataset using the project's data loader
-    and generate its profile.
+    Load and profile a training source.
 
-    IMPORTANT:
-    The current data_loader.py functions such as
-    load_source1(), load_source2(), and load_source3()
-    do not accept a path argument.
-
-    Therefore we call:
-        loader()
-
-    instead of:
-        loader(path)
+    The loader function already knows the correct
+    dataset path from config.py, so no path is passed
+    into loader().
     """
 
     print()
     print("-" * 70)
     print(f"Loading: {name}")
-    print(f"Expected path: {path}")
+    print(f"Path: {path}")
     print("-" * 70)
-
-    # --------------------------------------------------------
-    # CHECK FILE
-    # --------------------------------------------------------
 
     if not path.exists():
 
-        print("WARNING: File does not exist.")
+        print(
+            "WARNING: File does not exist."
+        )
 
         return {
             "dataset": name,
@@ -376,15 +421,7 @@ def load_and_profile_source(
             "path": str(path),
         }
 
-    # --------------------------------------------------------
-    # LOAD DATA
-    # --------------------------------------------------------
-
     df = loader()
-
-    # --------------------------------------------------------
-    # BASIC INFORMATION
-    # --------------------------------------------------------
 
     print(
         f"Rows: {len(df):,}"
@@ -394,9 +431,52 @@ def load_and_profile_source(
         f"Columns: {len(df.columns)}"
     )
 
-    # --------------------------------------------------------
-    # PROFILE
-    # --------------------------------------------------------
+    return profile_source(
+        df,
+        name
+    )
+
+
+# ============================================================
+# LOAD + PROFILE TEST SOURCE
+# ============================================================
+
+def profile_test_source(
+    path: Path,
+    loader,
+    name: str
+) -> dict:
+    """
+    Load and profile a test source.
+    """
+
+    print()
+    print("-" * 70)
+    print(f"Loading: {name}")
+    print(f"Path: {path}")
+    print("-" * 70)
+
+    if not path.exists():
+
+        print(
+            "WARNING: File does not exist."
+        )
+
+        return {
+            "dataset": name,
+            "exists": False,
+            "path": str(path),
+        }
+
+    df = loader()
+
+    print(
+        f"Rows: {len(df):,}"
+    )
+
+    print(
+        f"Columns: {len(df.columns)}"
+    )
 
     return profile_source(
         df,
@@ -417,7 +497,7 @@ def main():
     print("=" * 70)
 
     # --------------------------------------------------------
-    # CREATE PROJECT DIRECTORIES
+    # CREATE DIRECTORIES
     # --------------------------------------------------------
 
     create_project_directories()
@@ -444,9 +524,9 @@ def main():
     # ========================================================
 
     report["train"]["source1"] = (
-        load_and_profile_source(
+        profile_train_source(
             TRAIN_SOURCE1,
-            load_source1,
+            load_train_source1,
             "train_source1",
         )
     )
@@ -456,9 +536,9 @@ def main():
     # ========================================================
 
     report["train"]["source2"] = (
-        load_and_profile_source(
+        profile_train_source(
             TRAIN_SOURCE2,
-            load_source2,
+            load_train_source2,
             "train_source2",
         )
     )
@@ -468,9 +548,9 @@ def main():
     # ========================================================
 
     report["train"]["source3"] = (
-        load_and_profile_source(
+        profile_train_source(
             TRAIN_SOURCE3,
-            load_source3,
+            load_train_source3,
             "train_source3",
         )
     )
@@ -480,9 +560,9 @@ def main():
     # ========================================================
 
     report["test"]["source1"] = (
-        load_and_profile_source(
+        profile_test_source(
             TEST_SOURCE1,
-            load_source1,
+            load_test_source1,
             "test_source1",
         )
     )
@@ -492,9 +572,9 @@ def main():
     # ========================================================
 
     report["test"]["source2"] = (
-        load_and_profile_source(
+        profile_test_source(
             TEST_SOURCE2,
-            load_source2,
+            load_test_source2,
             "test_source2",
         )
     )
@@ -504,26 +584,28 @@ def main():
     # ========================================================
 
     report["test"]["source3"] = (
-        load_and_profile_source(
+        profile_test_source(
             TEST_SOURCE3,
-            load_source3,
+            load_test_source3,
             "test_source3",
         )
     )
 
     # ========================================================
-    # GROUND TRUTH
+    # TRAIN GROUND TRUTH
     # ========================================================
 
     print()
     print("-" * 70)
     print("Loading: train_ground_truth")
-    print(f"Expected path: {TRAIN_GROUND_TRUTH}")
+    print(f"Path: {TRAIN_GROUND_TRUTH}")
     print("-" * 70)
 
     if TRAIN_GROUND_TRUTH.exists():
 
-        ground_truth = load_ground_truth()
+        ground_truth = (
+            load_train_ground_truth()
+        )
 
         report["ground_truth"] = (
             profile_ground_truth(
@@ -546,7 +628,9 @@ def main():
         )
 
         report["ground_truth"] = {
+
             "exists": False,
+
             "path": str(
                 TRAIN_GROUND_TRUTH
             ),
@@ -580,7 +664,7 @@ def main():
         )
 
     # ========================================================
-    # FINAL MESSAGE
+    # COMPLETE
     # ========================================================
 
     print()
@@ -592,6 +676,7 @@ def main():
     print(
         f"Report saved to:\n{output_file}"
     )
+
     print()
 
 
