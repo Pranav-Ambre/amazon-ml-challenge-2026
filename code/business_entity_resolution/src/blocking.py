@@ -2,43 +2,32 @@
 
 """
 Amazon ML Challenge 2026
-Stage 04 — Production Candidate Blocking
+Stage 03 — Candidate Blocking
 
-Pipeline:
-    Normalized Parquet
-        ↓
-    Blocking keys
-        ↓
-    6 blocking rules
-        ↓
-    Candidate pair generation
-        ↓
-    Union
-        ↓
-    Pair deduplication
-        ↓
-    Block support count
-        ↓
-    Candidate Parquet
+Generates candidate pairs between:
+
+    Source 1 -> Source 2
+    Source 1 -> Source 3
+
+Input:
+    artifacts/normalized/*.parquet
+
+Output:
+    artifacts/candidates/*.parquet
+    artifacts/candidates/*.metadata.json
 
 Designed for:
     8 vCPU
     64 GB RAM
     Polars
     Parquet
-
-Output:
-    artifacts/candidates/train_s1_s2_candidates.parquet
-    artifacts/candidates/train_s1_s3_candidates.parquet
 """
 
 from __future__ import annotations
 
-import argparse
 import gc
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -47,19 +36,38 @@ import psutil
 
 
 # ============================================================
-# PATHS
+# RESOURCE MONITOR
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROCESS = psutil.Process(os.getpid())
 
-NORMALIZED_DIR = PROJECT_ROOT / "artifacts" / "normalized"
-CANDIDATE_DIR = PROJECT_ROOT / "artifacts" / "candidates"
 
-CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+def process_ram_gb() -> float:
+    return PROCESS.memory_info().rss / (1024 ** 3)
+
+
+def system_ram_gb() -> tuple[float, float]:
+    mem = psutil.virtual_memory()
+
+    used = mem.used / (1024 ** 3)
+    available = mem.available / (1024 ** 3)
+
+    return used, available
+
+
+def print_resource_status(prefix: str = "") -> None:
+    used, available = system_ram_gb()
+
+    print(
+        f"{prefix}"
+        f"Process RAM: {process_ram_gb():.2f} GB | "
+        f"System used: {used:.2f} GB | "
+        f"Available: {available:.2f} GB"
+    )
 
 
 # ============================================================
-# CONFIGURATION
+# BLOCKING CONFIGURATION
 # ============================================================
 
 ENTITY_COL = "entity_id"
@@ -81,12 +89,12 @@ BLOCKS = [
         "maximum_bucket": 1000,
     },
     {
-        "key": "_k_name_prefix6",
+        "key": "_k_exact_name",
         "name": "name_prefix6",
         "maximum_bucket": 500,
     },
     {
-        "key": "_k_name_prefix4",
+        "key": "_k_exact_name",
         "name": "name_prefix4",
         "maximum_bucket": 250,
     },
@@ -98,89 +106,115 @@ BLOCKS = [
 ]
 
 
+REQUIRED_COLUMNS = [
+    ENTITY_COL,
+    "business_name_compact",
+    "business_address_compact",
+    "business_name_sorted_tokens",
+    "business_address_numeric_tokens",
+]
+
+
 # ============================================================
-# RESOURCE MONITORING
+# INPUT VALIDATION
 # ============================================================
 
-PROCESS = psutil.Process(os.getpid())
+def validate_normalized_file(path: Path) -> Path:
+    """
+    Verify that a normalized Parquet file exists and is non-empty.
+    """
 
+    path = Path(path)
 
-def process_ram_gb() -> float:
-    """Return current Python process RSS in GiB."""
-    return PROCESS.memory_info().rss / (1024 ** 3)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"\nNormalized file not found:\n"
+            f"  {path}\n"
+        )
 
+    if path.stat().st_size == 0:
+        raise ValueError(
+            f"\nNormalized file is empty:\n"
+            f"  {path}\n"
+        )
 
-def system_ram_gb() -> tuple[float, float]:
-    """Return used and available system RAM in GiB."""
-    mem = psutil.virtual_memory()
-
-    used = mem.used / (1024 ** 3)
-    available = mem.available / (1024 ** 3)
-
-    return used, available
-
-
-def print_resource_status(prefix: str = "") -> None:
-    used, available = system_ram_gb()
-
-    print(
-        f"{prefix}"
-        f"Process RAM: {process_ram_gb():.2f} GB | "
-        f"System used: {used:.2f} GB | "
-        f"Available: {available:.2f} GB"
-    )
+    return path
 
 
 # ============================================================
 # DATA LOADING
 # ============================================================
 
-def normalized_path(source: str) -> Path:
-    path = NORMALIZED_DIR / f"train_{source}_normalized.parquet"
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Normalized file not found:\n{path}"
-        )
-
-    return path
-
-
-def load_normalized(source: str) -> pl.LazyFrame:
+def load_normalized(path: Path) -> pl.LazyFrame:
     """
-    Lazily load normalized dataset.
-
-    Only columns required by blocking are selected.
+    Lazily load normalized Parquet and create the six
+    blocking keys required by the candidate generator.
     """
 
-    path = normalized_path(source)
+    path = validate_normalized_file(path)
 
-    required_columns = [
-        ENTITY_COL,
-        "_k_exact_name",
-        "_k_exact_address",
-        "_k_sorted_name",
-        "_k_name_prefix6",
-        "_k_name_prefix4",
-        "_k_numeric_address",
-    ]
-
-    print(f"Loading normalized {source}:")
+    print()
+    print("Loading normalized file:")
     print(f"  {path}")
 
     return (
         pl.scan_parquet(path)
-        .select(required_columns)
+        .select(
+            [
+                ENTITY_COL,
+                "business_name_compact",
+                "business_address_compact",
+                "business_name_sorted_tokens",
+                "business_address_numeric_tokens",
+            ]
+        )
+        .with_columns(
+            [
+                pl.col("business_name_compact")
+                .str.slice(0, 6)
+                .alias("_k_name_prefix6"),
+
+                pl.col("business_name_compact")
+                .str.slice(0, 4)
+                .alias("_k_name_prefix4"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.col("business_name_compact")
+                .alias("_k_exact_name"),
+
+                pl.col("business_address_compact")
+                .alias("_k_exact_address"),
+
+                pl.col("business_name_sorted_tokens")
+                .alias("_k_sorted_name"),
+
+                pl.col("business_address_numeric_tokens")
+                .alias("_k_numeric_address"),
+            ]
+        )
+        .select(
+            [
+                ENTITY_COL,
+                "_k_exact_name",
+                "_k_exact_address",
+                "_k_sorted_name",
+                "_k_name_prefix6",
+                "_k_name_prefix4",
+                "_k_numeric_address",
+            ]
+        )
     )
 
 
 # ============================================================
-# BLOCK GENERATION
+# SINGLE BLOCK
 # ============================================================
 
 def make_block(
     s1: pl.LazyFrame,
-    s2: pl.LazyFrame,
+    candidate: pl.LazyFrame,
     key: str,
     block_name: str,
     maximum_bucket: int,
@@ -190,6 +224,10 @@ def make_block(
 
     Large buckets are discarded to prevent candidate explosion.
     """
+
+    # --------------------------------------------------------
+    # LEFT / SOURCE 1
+    # --------------------------------------------------------
 
     left = (
         s1
@@ -208,8 +246,12 @@ def make_block(
         )
     )
 
+    # --------------------------------------------------------
+    # RIGHT / CANDIDATE SOURCE
+    # --------------------------------------------------------
+
     right = (
-        s2
+        candidate
         .select(
             [
                 pl.col(ENTITY_COL).alias(
@@ -226,7 +268,7 @@ def make_block(
     )
 
     # --------------------------------------------------------
-    # Safe buckets on S1
+    # SAFE BUCKETS — SOURCE 1
     # --------------------------------------------------------
 
     left_keys = (
@@ -234,13 +276,14 @@ def make_block(
         .group_by(key)
         .len(name="_left_count")
         .filter(
-            pl.col("_left_count") <= maximum_bucket
+            pl.col("_left_count")
+            <= maximum_bucket
         )
         .select(key)
     )
 
     # --------------------------------------------------------
-    # Safe buckets on S2
+    # SAFE BUCKETS — CANDIDATE SOURCE
     # --------------------------------------------------------
 
     right_keys = (
@@ -248,13 +291,14 @@ def make_block(
         .group_by(key)
         .len(name="_right_count")
         .filter(
-            pl.col("_right_count") <= maximum_bucket
+            pl.col("_right_count")
+            <= maximum_bucket
         )
         .select(key)
     )
 
     # --------------------------------------------------------
-    # Keys must exist on both sides
+    # ONLY KEYS PRESENT ON BOTH SIDES
     # --------------------------------------------------------
 
     safe_keys = (
@@ -268,7 +312,7 @@ def make_block(
     )
 
     # --------------------------------------------------------
-    # Reduce both sides before many-to-many join
+    # REDUCE BOTH SIDES BEFORE MANY-TO-MANY JOIN
     # --------------------------------------------------------
 
     left = (
@@ -290,7 +334,7 @@ def make_block(
     )
 
     # --------------------------------------------------------
-    # Candidate generation
+    # MANY-TO-MANY CANDIDATE JOIN
     # --------------------------------------------------------
 
     return (
@@ -315,14 +359,42 @@ def make_block(
 
 
 # ============================================================
-# ONE SOURCE PAIR
+# CANDIDATE GENERATION
 # ============================================================
 
 def generate_candidates(
-    source1: str,
-    candidate_source: str,
+    source1_path: Path,
+    candidate_source_path: Path,
     output_path: Path,
+    candidate_source: str,
 ) -> dict:
+    """
+    Generate candidate pairs.
+
+    Parameters
+    ----------
+    source1_path:
+        Normalized Source 1 Parquet.
+
+    candidate_source_path:
+        Normalized Source 2 or Source 3 Parquet.
+
+    output_path:
+        Candidate Parquet output.
+
+    candidate_source:
+        "S2" or "S3".
+    """
+
+    source1_path = validate_normalized_file(
+        Path(source1_path)
+    )
+
+    candidate_source_path = validate_normalized_file(
+        Path(candidate_source_path)
+    )
+
+    output_path = Path(output_path)
 
     print()
     print("=" * 80)
@@ -331,17 +403,37 @@ def generate_candidates(
     )
     print("=" * 80)
 
+    print(f"S1:")
+    print(f"  {source1_path}")
+
+    print(f"Candidate source:")
+    print(f"  {candidate_source_path}")
+
+    print(f"Output:")
+    print(f"  {output_path}")
+
     overall_start = time.time()
 
-    s1 = load_normalized(source1)
-    s2 = load_normalized(candidate_source)
+    print_resource_status("Initial: ")
 
-    results: list[pl.LazyFrame] = []
+    # --------------------------------------------------------
+    # LOAD
+    # --------------------------------------------------------
+
+    s1 = load_normalized(
+        source1_path
+    )
+
+    candidate = load_normalized(
+        candidate_source_path
+    )
+
+    results = []
     block_stats = []
 
-    # --------------------------------------------------------
-    # Individual blocks
-    # --------------------------------------------------------
+    # ========================================================
+    # RUN SIX BLOCKS
+    # ========================================================
 
     for config in BLOCKS:
 
@@ -351,47 +443,67 @@ def generate_candidates(
 
         print()
         print("-" * 80)
-        print(f"Block: {block_name}")
-        print(f"Key: {key}")
-        print(f"Maximum bucket: {maximum_bucket:,}")
+        print(f"BLOCK: {block_name}")
+        print(f"KEY: {key}")
+        print(
+            f"MAX BUCKET: "
+            f"{maximum_bucket:,}"
+        )
+        print("-" * 80)
 
-        print_resource_status("Before: ")
+        print_resource_status(
+            "Before: "
+        )
 
         start = time.time()
 
         block = make_block(
-            s1,
-            s2,
-            key,
-            block_name,
-            maximum_bucket,
+            s1=s1,
+            candidate=candidate,
+            key=key,
+            block_name=block_name,
+            maximum_bucket=maximum_bucket,
         )
 
-        # Materialize the block before continuing.
+        # Materialize this block.
         block_df = block.collect(
             engine="streaming"
         )
 
-        elapsed = time.time() - start
-        candidate_count = len(block_df)
-
-        print(
-            f"Candidates: {candidate_count:,}"
-        )
-        print(
-            f"Time: {elapsed:.2f} sec"
+        elapsed = (
+            time.time() - start
         )
 
-        print_resource_status("After:  ")
+        candidate_count = len(
+            block_df
+        )
+
+        print(
+            f"Candidates: "
+            f"{candidate_count:,}"
+        )
+
+        print(
+            f"Runtime: "
+            f"{elapsed:.2f} sec"
+        )
+
+        print_resource_status(
+            "After:  "
+        )
 
         block_stats.append(
             {
                 "block": block_name,
                 "key": key,
-                "maximum_bucket": maximum_bucket,
-                "candidate_count": candidate_count,
-                "runtime_seconds": elapsed,
-                "process_ram_gb": process_ram_gb(),
+                "maximum_bucket":
+                    maximum_bucket,
+                "candidate_count":
+                    candidate_count,
+                "runtime_seconds":
+                    elapsed,
+                "process_ram_gb":
+                    process_ram_gb(),
             }
         )
 
@@ -402,9 +514,9 @@ def generate_candidates(
         del block_df
         gc.collect()
 
-    # --------------------------------------------------------
-    # Union all blocks
-    # --------------------------------------------------------
+    # ========================================================
+    # UNION
+    # ========================================================
 
     print()
     print("=" * 80)
@@ -419,7 +531,8 @@ def generate_candidates(
     )
 
     # --------------------------------------------------------
-    # Deduplicate candidate pair
+    # Deduplicate candidate pairs.
+    # Keep how many blocking rules produced each pair.
     # --------------------------------------------------------
 
     final_candidates = (
@@ -434,7 +547,9 @@ def generate_candidates(
             [
                 pl.col("block")
                 .n_unique()
-                .alias("block_support_count"),
+                .alias(
+                    "block_support_count"
+                ),
 
                 pl.col("block")
                 .unique()
@@ -458,30 +573,63 @@ def generate_candidates(
     )
 
     # --------------------------------------------------------
-    # Materialize final candidates
+    # Materialize final candidate set
     # --------------------------------------------------------
 
     final_df = final_candidates.collect(
         engine="streaming"
     )
 
-    union_elapsed = time.time() - union_start
+    union_elapsed = (
+        time.time() - union_start
+    )
+
+    final_count = len(
+        final_df
+    )
+
+    raw_candidate_count = sum(
+        x["candidate_count"]
+        for x in block_stats
+    )
+
+    duplicate_reduction = (
+        1.0
+        - (
+            final_count
+            / raw_candidate_count
+        )
+        if raw_candidate_count > 0
+        else 0.0
+    )
+
+    print(
+        f"Raw block candidates: "
+        f"{raw_candidate_count:,}"
+    )
 
     print(
         f"Final unique candidates: "
-        f"{len(final_df):,}"
+        f"{final_count:,}"
     )
 
     print(
-        f"Union/dedup time: "
+        f"Duplicate reduction: "
+        f"{duplicate_reduction * 100:.2f}%"
+    )
+
+    print(
+        f"Union runtime: "
         f"{union_elapsed:.2f} sec"
     )
 
-    print_resource_status("After union: ")
+    print_resource_status(
+        "After union: "
+    )
 
-    # --------------------------------------------------------
-    # Write output
-    # --------------------------------------------------------
+    # ========================================================
+    # WRITE PARQUET
+    # ========================================================
 
     print()
     print("=" * 80)
@@ -495,9 +643,12 @@ def generate_candidates(
 
     if output_path.exists():
         print(
-            f"Removing existing output:\n"
-            f"{output_path}"
+            f"Removing existing output:"
         )
+        print(
+            f"  {output_path}"
+        )
+
         output_path.unlink()
 
     write_start = time.time()
@@ -506,233 +657,214 @@ def generate_candidates(
         output_path,
         compression="zstd",
         compression_level=3,
-        statistics=True,
     )
 
-    write_elapsed = time.time() - write_start
+    write_elapsed = (
+        time.time() - write_start
+    )
 
-    output_size_mb = (
+    output_size_bytes = (
         output_path.stat().st_size
-        / (1024 ** 2)
+    )
+
+    output_size_gb = (
+        output_size_bytes
+        / (1024 ** 3)
     )
 
     print(
-        f"Output: {output_path}"
+        f"Output written:"
+    )
+    print(
+        f"  {output_path}"
     )
 
     print(
         f"Output size: "
-        f"{output_size_mb:,.2f} MB"
+        f"{output_size_gb:.2f} GB"
     )
 
     print(
-        f"Write time: "
+        f"Write runtime: "
         f"{write_elapsed:.2f} sec"
     )
 
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
+    # ========================================================
+    # FINAL SUMMARY
+    # ========================================================
 
-    total_elapsed = time.time() - overall_start
-
-    source1_count = (
-        s1.select(pl.len())
-        .collect()
-        .item()
+    total_elapsed = (
+        time.time() - overall_start
     )
 
-    candidate_count = len(final_df)
+    print()
+    print("=" * 80)
+    print("BLOCKING COMPLETE")
+    print("=" * 80)
 
-    average_candidates = (
-        candidate_count / source1_count
-        if source1_count
-        else 0
+    print(
+        f"Candidate source: "
+        f"{candidate_source}"
     )
 
-    reduction_ratio = (
-        source1_count
-        if candidate_count == 0
-        else (
-            source1_count * 1.0
+    print(
+        f"Raw block candidates: "
+        f"{raw_candidate_count:,}"
+    )
+
+    print(
+        f"Final unique candidates: "
+        f"{final_count:,}"
+    )
+
+    print(
+        f"Total runtime: "
+        f"{total_elapsed:.2f} sec"
+    )
+
+    print_resource_status(
+        "Final: "
+    )
+
+    # ========================================================
+    # METADATA
+    # ========================================================
+
+    metadata = {
+        "stage":
+            "03_candidate_generation",
+
+        "source1_path":
+            str(source1_path),
+
+        "candidate_source":
+            candidate_source,
+
+        "candidate_source_path":
+            str(candidate_source_path),
+
+        "output_path":
+            str(output_path),
+
+        "blocks":
+            block_stats,
+
+        "raw_block_candidate_total":
+            raw_candidate_count,
+
+        "final_unique_candidates":
+            final_count,
+
+        "duplicate_reduction":
+            duplicate_reduction,
+
+        "union_runtime_seconds":
+            union_elapsed,
+
+        "write_runtime_seconds":
+            write_elapsed,
+
+        "total_runtime_seconds":
+            total_elapsed,
+
+        "output_size_bytes":
+            output_size_bytes,
+
+        "output_size_gb":
+            output_size_gb,
+
+        "final_process_ram_gb":
+            process_ram_gb(),
+    }
+
+    metadata_path = (
+        output_path.with_suffix(
+            ".metadata.json"
         )
     )
 
-    # --------------------------------------------------------
-    # Metadata
-    # --------------------------------------------------------
-
-    metadata = {
-        "stage": "04_blocking",
-        "source1": source1,
-        "candidate_source": candidate_source,
-        "source1_rows": source1_count,
-        "unique_candidate_pairs": candidate_count,
-        "average_candidates_per_source1": average_candidates,
-        "block_stats": block_stats,
-        "union_runtime_seconds": union_elapsed,
-        "write_runtime_seconds": write_elapsed,
-        "total_runtime_seconds": total_elapsed,
-        "output_path": str(output_path),
-        "output_size_mb": output_size_mb,
-        "blocking_rules": BLOCKS,
-        "candidate_schema": {
-            "source1_entity_id": "entity identifier from source1",
-            "candidate_entity_id": "candidate entity identifier",
-            "candidate_source": "S2 or S3",
-            "block_support_count": "number of blocking rules supporting pair",
-            "blocks": "blocking rules supporting pair",
-        },
-    }
-
-    metadata_path = output_path.with_suffix(
-        ".metadata.json"
-    )
-
-    with metadata_path.open(
+    with open(
+        metadata_path,
         "w",
         encoding="utf-8",
     ) as f:
+
         json.dump(
             metadata,
             f,
             indent=2,
         )
 
-    # --------------------------------------------------------
-    # Final report
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 80)
-    print("FINAL BLOCKING RESULT")
-    print("=" * 80)
-
-    print(
-        f"Source:                 {source1}"
-    )
-
-    print(
-        f"Candidate source:       {candidate_source}"
-    )
-
-    print(
-        f"Source1 rows:            "
-        f"{source1_count:,}"
-    )
-
-    print(
-        f"Unique candidate pairs:  "
-        f"{candidate_count:,}"
-    )
-
-    print(
-        f"Avg candidates/S1:       "
-        f"{average_candidates:.2f}"
-    )
-
-    print(
-        f"Union/dedup time:        "
-        f"{union_elapsed:.2f} sec"
-    )
-
-    print(
-        f"Write time:              "
-        f"{write_elapsed:.2f} sec"
-    )
-
-    print(
-        f"Total runtime:           "
-        f"{total_elapsed / 60:.2f} min"
-    )
-
-    print(
-        f"Output size:             "
-        f"{output_size_mb:.2f} MB"
-    )
-
     print()
     print(
-        f"Metadata: {metadata_path}"
+        f"Metadata:"
     )
-
     print(
-        f"Candidates: {output_path}"
+        f"  {metadata_path}"
     )
 
-    print("=" * 80)
-
-    # --------------------------------------------------------
-    # Cleanup
-    # --------------------------------------------------------
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
     del final_df
     del final_candidates
     del all_candidates
+    del results
+    del s1
+    del candidate
+
     gc.collect()
 
     return metadata
 
 
 # ============================================================
-# CLI
+# COMMAND LINE SUPPORT
 # ============================================================
 
-def main() -> None:
+if __name__ == "__main__":
+
+    import argparse
 
     parser = argparse.ArgumentParser(
         description=(
             "Amazon ML Challenge 2026 "
-            "Stage 04 candidate blocking"
+            "candidate generation"
         )
     )
 
     parser.add_argument(
+        "--source1",
+        required=True,
+        type=Path,
+    )
+
+    parser.add_argument(
         "--candidate-source",
-        choices=["S2", "S3", "both"],
-        default="S2",
-        help="Candidate source to block against.",
+        required=True,
+        type=Path,
+    )
+
+    parser.add_argument(
+        "--candidate-label",
+        required=True,
+        choices=["S2", "S3"],
+    )
+
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
     )
 
     args = parser.parse_args()
 
-    print()
-    print("=" * 80)
-    print("AMAZON ML CHALLENGE 2026")
-    print("STAGE 04 — BLOCKING")
-    print("=" * 80)
-
-    if args.candidate_source in ("S2", "both"):
-
-        output = (
-            CANDIDATE_DIR
-            / "train_s1_s2_candidates.parquet"
-        )
-
-        generate_candidates(
-            source1="S1",
-            candidate_source="S2",
-            output_path=output,
-        )
-
-    if args.candidate_source in ("S3", "both"):
-
-        output = (
-            CANDIDATE_DIR
-            / "train_s1_s3_candidates.parquet"
-        )
-
-        generate_candidates(
-            source1="S1",
-            candidate_source="S3",
-            output_path=output,
-        )
-
-    print()
-    print("=" * 80)
-    print("BLOCKING STAGE COMPLETE")
-    print("=" * 80)
-
-
-if __name__ == "__main__":
-    main()
+    generate_candidates(
+        source1_path=args.source1,
+        candidate_source_path=(
+            args.candidate_source
+        ),
+        output_path=args.output,
+        candidate_source=args.candidate_label,
+    )

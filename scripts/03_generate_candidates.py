@@ -2,54 +2,44 @@
 
 """
 Amazon ML Challenge 2026
-Stage 03 — Full Dataset Candidate Generation
+Stage 03 — Training Candidate Generation
 
-Uses the production blocking implementation from:
+Generates:
 
-code/business_entity_resolution/src/blocking.py
+    Train Source 1 -> Train Source 2
+    Train Source 1 -> Train Source 3
 
-Current generate_candidates() API:
+Input:
+    artifacts/normalized/
 
-    generate_candidates(
-        source1="S1",
-        candidate_source="S2",
-        output_path=...
-    )
+Output:
+    artifacts/candidates/
 
-Training candidate generation:
-    S1 -> S2
-    S1 -> S3
-
-Test candidate generation is intentionally NOT included here because
-the current blocking implementation resolves normalized files using
-the train_* naming convention. Test blocking should be added only
-after the blocking module is made test-aware.
+Large Parquet files stay on EC2.
+Compact metadata/report files can be committed to GitHub.
 """
 
 from __future__ import annotations
 
-import sys
+import json
 import time
 from pathlib import Path
+import sys
+
+# Add repository code directory to Python import path.
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "code"))
+
+from business_entity_resolution.src.blocking import (
+    generate_candidates,
+)
 
 
 # ============================================================
-# PROJECT ROOT
+# PROJECT PATH
 # ============================================================
 
 ROOT = Path(__file__).resolve().parents[1]
-
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-
-# ============================================================
-# IMPORT BLOCKING ENGINE
-# ============================================================
-
-from code.business_entity_resolution.src.blocking import (
-    generate_candidates,
-)
 
 
 # ============================================================
@@ -57,66 +47,119 @@ from code.business_entity_resolution.src.blocking import (
 # ============================================================
 
 NORMALIZED_DIR = (
-    ROOT
-    / "artifacts"
-    / "normalized"
+    ROOT / "artifacts" / "normalized"
 )
 
-CANDIDATES_DIR = (
-    ROOT
-    / "artifacts"
-    / "candidates"
+CANDIDATE_DIR = (
+    ROOT / "artifacts" / "candidates"
+)
+
+REPORT_DIR = (
+    ROOT / "artifacts" / "reports"
+)
+
+
+CANDIDATE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+REPORT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
 )
 
 
 # ============================================================
-# TRAINING JOBS
+# NORMALIZED INPUT FILES
+# ============================================================
+
+TRAIN_SOURCE1 = (
+    NORMALIZED_DIR
+    / "train_source1_normalized.parquet"
+)
+
+TRAIN_SOURCE2 = (
+    NORMALIZED_DIR
+    / "train_source2_normalized.parquet"
+)
+
+TRAIN_SOURCE3 = (
+    NORMALIZED_DIR
+    / "train_source3_normalized.parquet"
+)
+
+
+# ============================================================
+# JOBS
 # ============================================================
 
 JOBS = [
     {
         "name": "train_s1_s2",
-        "source1": "S1",
-        "candidate_source": "S2",
-        "output": (
-            CANDIDATES_DIR
-            / "train_s1_s2_candidates.parquet"
-        ),
+
+        "source1":
+            TRAIN_SOURCE1,
+
+        "candidate_source":
+            TRAIN_SOURCE2,
+
+        "candidate_label":
+            "S2",
+
+        "output":
+            CANDIDATE_DIR
+            / "train_s1_s2_candidates.parquet",
     },
+
     {
         "name": "train_s1_s3",
-        "source1": "S1",
-        "candidate_source": "S3",
-        "output": (
-            CANDIDATES_DIR
-            / "train_s1_s3_candidates.parquet"
-        ),
+
+        "source1":
+            TRAIN_SOURCE1,
+
+        "candidate_source":
+            TRAIN_SOURCE3,
+
+        "candidate_label":
+            "S3",
+
+        "output":
+            CANDIDATE_DIR
+            / "train_s1_s3_candidates.parquet",
     },
 ]
 
 
 # ============================================================
-# INPUT VALIDATION
+# VALIDATE INPUTS
 # ============================================================
 
 def validate_inputs() -> None:
 
     print()
     print("=" * 80)
-    print("CHECKING NORMALIZED INPUT FILES")
+    print("VALIDATING NORMALIZED INPUTS")
     print("=" * 80)
 
-    required = [
-        NORMALIZED_DIR / "train_source1_normalized.parquet",
-        NORMALIZED_DIR / "train_source2_normalized.parquet",
-        NORMALIZED_DIR / "train_source3_normalized.parquet",
-    ]
+    for path in [
+        TRAIN_SOURCE1,
+        TRAIN_SOURCE2,
+        TRAIN_SOURCE3,
+    ]:
 
-    for path in required:
+        print()
+        print(
+            f"Checking:\n"
+            f"  {path}"
+        )
 
         if not path.exists():
+
             raise FileNotFoundError(
-                f"\nMissing normalized input:\n{path}\n"
+                f"\nRequired normalized file "
+                f"not found:\n"
+                f"  {path}\n"
             )
 
         size_gb = (
@@ -125,74 +168,22 @@ def validate_inputs() -> None:
         )
 
         print(
-            f"✓ {path.name}"
-            f" ({size_gb:.2f} GB)"
+            f"Size: "
+            f"{size_gb:.2f} GB"
         )
 
+        if path.stat().st_size == 0:
 
-# ============================================================
-# RUN ONE JOB
-# ============================================================
-
-def run_job(job: dict) -> dict:
-
-    name = job["name"]
-    source1 = job["source1"]
-    candidate_source = job["candidate_source"]
-    output_path = job["output"]
+            raise ValueError(
+                f"Normalized file is empty:\n"
+                f"  {path}"
+            )
 
     print()
-    print("#" * 80)
-    print(f"# {name.upper()}")
-    print("#" * 80)
-
-    print()
-    print(f"Source 1:        {source1}")
-    print(f"Candidate source:{candidate_source}")
-    print(f"Output:          {output_path}")
-
-    start = time.perf_counter()
-
-    result = generate_candidates(
-        source1=source1,
-        candidate_source=candidate_source,
-        output_path=output_path,
-    )
-
-    elapsed = (
-        time.perf_counter()
-        - start
-    )
-
-    print()
-    print("-" * 80)
-    print(f"{name} COMPLETE")
-    print("-" * 80)
-
     print(
-        f"Elapsed time: "
-        f"{elapsed / 60:.2f} minutes"
+        "All normalized training "
+        "files are available."
     )
-
-    if isinstance(result, dict):
-
-        if "unique_candidate_pairs" in result:
-            print(
-                "Candidate pairs: "
-                f"{result['unique_candidate_pairs']:,}"
-            )
-
-        if "output_size_mb" in result:
-            print(
-                "Output size: "
-                f"{result['output_size_mb']:.2f} MB"
-            )
-
-    return {
-        "name": name,
-        "elapsed_seconds": elapsed,
-        "result": result,
-    }
 
 
 # ============================================================
@@ -201,100 +192,137 @@ def run_job(job: dict) -> dict:
 
 def main() -> None:
 
-    print()
-    print("=" * 80)
-    print("AMAZON ML CHALLENGE 2026")
-    print("STAGE 03 — FULL DATASET CANDIDATE GENERATION")
-    print("=" * 80)
-
-    # --------------------------------------------------------
-    # Validate normalized data
-    # --------------------------------------------------------
-
     validate_inputs()
 
-    CANDIDATES_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    overall_start = time.time()
 
-    # --------------------------------------------------------
-    # Overall timer
-    # --------------------------------------------------------
+    summaries = []
 
-    overall_start = time.perf_counter()
-
-    results = []
-
-    # --------------------------------------------------------
-    # Run jobs sequentially
-    # --------------------------------------------------------
+    # ========================================================
+    # RUN JOBS SEQUENTIALLY
+    # ========================================================
 
     for job in JOBS:
 
-        result = run_job(job)
+        print()
+        print()
+        print("#" * 80)
+        print(
+            f"STARTING: {job['name']}"
+        )
+        print("#" * 80)
 
-        results.append(result)
+        start = time.time()
+
+        metadata = generate_candidates(
+
+            source1_path=
+                job["source1"],
+
+            candidate_source_path=
+                job["candidate_source"],
+
+            output_path=
+                job["output"],
+
+            candidate_source=
+                job["candidate_label"],
+        )
+
+        elapsed = (
+            time.time() - start
+        )
+
+        summaries.append(
+            {
+                "job":
+                    job["name"],
+
+                "candidate_source":
+                    job["candidate_label"],
+
+                "output":
+                    str(job["output"]),
+
+                "runtime_seconds":
+                    elapsed,
+
+                "metadata":
+                    metadata,
+            }
+        )
 
         print()
         print(
-            "Waiting before next candidate-generation job..."
+            f"COMPLETED: "
+            f"{job['name']}"
         )
 
-    # --------------------------------------------------------
-    # Final summary
-    # --------------------------------------------------------
+        print(
+            f"Runtime: "
+            f"{elapsed:.2f} sec"
+        )
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
 
     total_elapsed = (
-        time.perf_counter()
+        time.time()
         - overall_start
     )
 
-    print()
-    print()
-    print("#" * 80)
-    print("# STAGE 03 COMPLETE")
-    print("#" * 80)
+    report = {
 
-    print()
+        "stage":
+            "03_candidate_generation",
 
-    for result in results:
+        "jobs":
+            summaries,
 
-        print(
-            f"{result['name']:20s} "
-            f"{result['elapsed_seconds'] / 60:8.2f} min"
+        "total_runtime_seconds":
+            total_elapsed,
+    }
+
+    report_path = (
+        REPORT_DIR
+        / "candidate_generation_report.json"
+    )
+
+    with open(
+        report_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            report,
+            f,
+            indent=2,
         )
 
-    print("-" * 80)
+    # ========================================================
+    # COMPLETE
+    # ========================================================
+
+    print()
+    print("=" * 80)
+    print("STAGE 03 COMPLETE")
+    print("=" * 80)
 
     print(
-        f"{'TOTAL':20s} "
-        f"{total_elapsed / 60:8.2f} min"
+        f"Total runtime: "
+        f"{total_elapsed:.2f} sec"
     )
 
     print()
-    print("Generated outputs:")
+    print(
+        f"Report:"
+    )
 
-    for job in JOBS:
-
-        output = job["output"]
-
-        metadata = output.with_suffix(
-            ".metadata.json"
-        )
-
-        print(
-            f"  Candidate: {output}"
-        )
-
-        print(
-            f"  Metadata:  {metadata}"
-        )
-
-    print()
-    print("=" * 80)
-    print("NEXT STEP: INSPECT CANDIDATE COUNTS AND OUTPUT SIZES")
-    print("=" * 80)
+    print(
+        f"  {report_path}"
+    )
 
 
 # ============================================================
