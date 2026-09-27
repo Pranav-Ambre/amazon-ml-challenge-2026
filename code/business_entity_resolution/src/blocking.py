@@ -36,7 +36,7 @@ NAME_COL = "business_name_compact"
 
 ADDRESS_COL = "business_address_compact"
 
-NUMERIC_ADDRESS_COL = "business_address_numeric"
+NUMERIC_ADDRESS_COL = "business_address_numeric_tokens"
 
 SORTED_NAME_COL = "business_name_sorted_tokens"
 
